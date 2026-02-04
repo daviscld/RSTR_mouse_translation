@@ -1,0 +1,393 @@
+---
+title: "COMPASS_clean"
+author: "Christine Wiggins"
+date: "2024-04-29"
+output: html_document
+---
+
+#to run this, you need the csv files exported
+#from FlowJo that have polyfunctional subset frequencies, as well as parent
+#you can generate these from FCS files directly
+
+#subset cell counts and metadata
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(reshape2)
+library(COMPASS)
+library(ggplot2)
+library(dplyr)
+library(reshape2)
+#library(readxl)
+library(readr)
+library(stringr)
+library(gridExtra)
+library(tidyverse)
+library(ggpubr)
+```
+
+#To start from FlowJo csv files, you need:
+1) frequency of polyfunctional subsets (exclude bulk & single cytokine)
+2) parent cell count total
+3) count data for polyfunctional subsets (can get via multiplying 1 & 2 and rounding)
+
+You need this for both your stimulated and unstimulated conditions
+
+```{r load from FlowJo}
+#load count data for the stimulated and unstimulated (combined in one)
+compass_data <- as.data.frame(read.csv('COMPASS/CD4_p300_data.csv',
+                                       header=TRUE, check.names = FALSE,
+                                       stringsAsFactors = FALSE))
+rownames(compass_data) <- compass_data[,1]
+compass_data <- compass_data[,2:ncol(compass_data)]
+
+#################### METADATA #########################
+
+metadata <- read.csv('COMPASS/CD4_p300_metadata.csv', 
+                     header=TRUE, check.names = FALSE)
+metadata <- as.data.frame(metadata)
+rownames(metadata) <- metadata[,1]
+metadata <- metadata[,2:ncol(metadata)]
+
+################# remove any missing data #################
+
+metadata <- metadata[-which(metadata$unique_id == names(which(is.na(rowMeans(compass_data))))),]
+compass_data<- compass_data[-which(grepl(names(which(is.na(rowMeans(compass_data)))), rownames(compass_data))),]
+
+######### Split data into stimulated and unstimulated ##########
+
+n_u = as.matrix(subset(compass_data, metadata$stim == "unstim"))
+n_s = as.matrix(subset(compass_data, metadata$stim == "p300"))
+
+####Name and order rows of all the matrices #############
+
+# assign consistent row names to n_u and n_s
+rownames(n_u) = subset(metadata$unique_id, metadata$stim=="unstim")
+rownames(n_s) = subset(metadata$unique_id, metadata$stim=="p300")
+# Now all matrices have the same dimensions and appropriate rownames
+
+#run compass
+compass_fit = COMPASS::SimpleCOMPASS(n_s = n_s, 
+                                      n_u = n_u,
+                                      meta = subset(metadata, 
+                                                    metadata$stim == "unstim"), 
+                                     #just take one metadata, same for stim/unstim
+                                      individual_id = "unique_id", 
+                                      iterations = 40000, #n_iterations
+                                      replications = 8)
+
+```
+
+#To start from a saved COMPASS object
+```{r load from COMPASS}
+#load correct COMPASS object
+
+compass_fit <- readRDS("your_compass_object.RDS")
+#to run this for the paper, use provided cd4_p300_wk5_fit.RDS
+
+```
+
+#Change below to use whatever metadata is relevant to your plotting
+#For paper, we had phenotype info in the COMPASS metadata
+```{r polyfunctionality plots}
+#determining significance for pfs plot
+pfs <- as.data.frame(PolyfunctionalityScore(compass_fit))
+pfs$Phenotype <- compass_fit$data$meta$Phenotype
+re <- pfs[which(pfs$Phenotype == "R"), 1]
+ca <- pfs[which(pfs$Phenotype == "C"), 1]
+p <- wilcox.test(re, ca)[["p.value"]]
+
+#plot polyfunctionality scores
+pfs_plot <- ggplot(data = scores(compass_fit), 
+                   mapping = aes(x = Phenotype, y = PFS, fill = Phenotype)) +
+    geom_boxplot(outlier.colour = NA) +
+    geom_jitter() +
+    stat_summary(fun = median, geom = "text", aes(label = after_stat(y)), vjust = 15) + 
+    theme_classic() +
+    scale_fill_manual(breaks = c("R", "C"), values = c('#8C02CC', '#5192C3')) +
+    labs(y = "Polyfunctionality Score") + 
+    theme(plot.caption = element_text(vjust = 160, hjust = 0.7)) + 
+    labs(caption = paste0("p = ", p)) 
+
+#save pdf
+pdf("your_pdf.pdf", width = 5, height = 7)
+print(pfs_plot)
+dev.off()
+
+#save data
+library(openxlsx)
+write.xlsx(pfs, "Data_for_stim.xlsx")
+```
+
+#Get heatmaps of all subsets detected to be antigen-specific
+```{r all detected subset heatmaps}
+
+#use compass plotting
+plot(compass_fit, "Phenotype")
+
+pdf("your_pdf.pdf", width = 20, height = 20, paper = "letter")
+plot(compass_fit, "Phenotype")
+dev.off()
+```
+
+#Downselect to only subsets different between NCan & canonical mice & above
+#a certain threshold
+```{r sig diff subsets}
+#saving the filtered subsets that COMPASS identifies
+threshold = 0.01
+means <- apply(compass_fit$fit$mean_gamma, 2, function(x) {
+  mean(x)
+})
+i <- means > threshold
+filtered_subsets <- names(which(i))
+
+#Pull data from COMPASS object
+corrected_dat <- compass_fit$data$n_s #stimulated data
+meta <- compass_fit$data$meta
+
+```
+
+#Plot % frequencies - need all the original polyfunctional frequencies from
+#FlowJo exports for stim & unstim conditions
+```{r subset frequency plotting}
+
+#want frequencies
+cd4_p300_data <- as.data.frame(read_csv("Count Frequency CD4 p300.csv"))
+cd4_unstim_data <- as.data.frame(read_csv("Count Frequency CD4 unstim.csv"))
+cd4_p300_parent_count <- as.data.frame(read_csv("Parent Count CD4 p300.csv"))
+cd4_unstim_parent_count <- as.data.frame(read_csv("Parent Count CD4 unstim.csv"))
+
+#take out mean, sd from csvs from FlowJo
+#This is hard-coded, so double check row & column indices
+cd4_p300_data <- as.data.frame(cd4_p300_data[1:55,2:(ncol(cd4_p300_data)-1)])
+cd4_unstim_data <- as.data.frame(cd4_unstim_data[1:55,2:(ncol(cd4_unstim_data)-1)])
+
+#also need metadata so i can take out FMOs & controls
+metadata <- as.data.frame(read_excel("Metadata_for_COMPASS.xlsx", sheet = 2))
+
+#take only one stim at a time, plus unstim
+#Be careful here, this is hard-coded
+metadata <- metadata[1:56,1:6]
+colnames(metadata) <- metadata[1,]
+metadata <- metadata[2:nrow(metadata),]
+metadata$unique_id <- paste0(metadata[[4]], "_", metadata[[3]], "_", metadata[[1]])
+
+#for ones with FMO or NA
+ind <- c(which(grepl("FMO", metadata$`Mouse ID`)), 
+         which(is.na(metadata$Mouse_ID)),
+         which(grepl("uninf", metadata$Genotype)))
+cd4_p300_data <- cd4_p300_data[-ind,]
+cd4_unstim_data <- cd4_unstim_data[-ind,]
+metadata <- metadata[-ind,]
+
+#doing background correction on data (subtract unstim freq from stim freq)
+corrected_dat <- cd4_p300_data - cd4_unstim_data
+corrected_dat[corrected_dat<0] <- 0
+rownames(corrected_dat) <- meta$unique_id
+corrected_dat$Phenotype <- meta$Phenotype
+
+#changing column names to a COMPASS format
+nms = basename(colnames(corrected_dat))
+nms = gsub(" \\| Freq. of Parent \\(\\%\\)", "", nms)
+nms = gsub("\\.{3}\\d+", "", nms)
+nms = COMPASS:::translate_marker_names(nms)
+colnames(corrected_dat) = nms
+
+#take only subsets previously determined to pass frequency filter in COMPASS
+corrected_dat <- corrected_dat[,filtered_subsets]
+
+#calculating p values and doing multiple hypothesis correction
+ncan <- which(metadata$Phenotype == "R")
+canon <- which(metadata$Phenotype == "C")
+
+p <- c()
+for(x in filtered_subsets){
+  re <- corrected_dat[ncan, grep(paste0("^", x, "$"), colnames(corrected_dat))]
+  ca <- corrected_dat[canon, grep(paste0("^", x, "$"), colnames(corrected_dat))]
+  p <- c(p, wilcox.test(re, ca)[["p.value"]])
+}
+p <- p.adjust(p, method = "BH")
+names(p) <- filtered_subsets
+
+#plotting just the subsets that show significant differences between R and C
+#(NCan and Canonical)
+p_sig <- p[which(p < 0.05)]
+p_sig <- names(p_sig)
+d <- data.frame(metadata$Phenotype)
+for(i in 1:length(p_sig)){
+  d[p_sig[i]] <- corrected_dat[[grep(paste0("^", p_sig[i], "$"), colnames(corrected_dat))]]
+}
+
+d <- melt(d)
+
+# Creating a data frame with p-values corresponding to each facet
+p_value_data <- data.frame(
+  variable = names(p[which(p < 0.05)]),
+  p_value = p[which(p < 0.05)]
+)
+
+# Merging p-values into the main dataset to align with each facet
+d_with_pvalues <- merge(d, p_value_data, by = "variable", all.x = FALSE, all.y = TRUE)
+
+# Calculate midpoints for each variable
+midpoints <- aggregate(value ~ variable + metadata.Phenotype, d_with_pvalues, median)
+
+# Calculate midpoint for each variable between "R" and "C"
+midpoints_summary <- aggregate(value ~ variable, midpoints, 
+                               function(x) diff(range(x)) / 2 + min(x))
+
+# Calculate midpoint between R and C for each variable
+midpoints_R_C <- aggregate(value ~ variable, d_with_pvalues, 
+                           function(x) diff(range(x)) / 2 + min(x))
+
+# Merge midpoints with p-values for R and C
+midpoints_p_values <- merge(midpoints_summary, midpoints_R_C, by = "variable")
+
+#Now separate into 2 subsets for good visualization
+
+# Filter variables with maximum value greater than 2
+large_subset <- d %>%
+  group_by(variable) %>%
+  summarise(max_value = max(value)) %>%
+  filter(max_value > 2)
+
+# Filter variables with maximum value less than 2
+small_subset <- d %>%
+  group_by(variable) %>%
+  summarise(max_value = max(value)) %>%
+  filter(max_value < 2)
+
+small_data <- d_with_pvalues[which(d_with_pvalues$variable %in% small_subset$variable),]
+plot_small <- ggplot(data = small_data, 
+                     aes(x = metadata.Phenotype, y = value)) +
+  geom_jitter(aes(color = metadata.Phenotype, 
+                  fill = metadata.Phenotype), size = 1) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.4, linewidth = 0.2,
+               aes(color = 'black')) +
+  stat_summary(fun.data = mean_se, geom = "errorbar") +
+  facet_grid(. ~ variable, scales = "free_x") +  # Facet on a single x-axis
+  theme_classic() +
+  scale_color_manual(breaks = c("R", "C"), values = c('#8C02CC', '#5192C3', 'black'))+
+  scale_fill_manual(breaks = c("R", "C"), values = c('#8C02CC', '#5192C3', 'black'))+
+  labs(x = "Phenotype", y = "Percentage responding CD4 T cells") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+         legend.position = "none") +
+  # Adding p-values using annotate or geom_text
+   geom_text(data = unique(subset(small_data, !is.na(p_value))), 
+             aes(label = paste("p =", formatC(p_value, 
+                                              digits = 3, format = "f"))),
+            x = Inf, y = max(small_data$value) / 2, hjust = 1, vjust = 0.5, size = 3)
+
+pdf("your_pdf.pdf", width = 5, height = 7)
+print(plot_small)
+dev.off()
+
+large_data <- d_with_pvalues[which(d_with_pvalues$variable %in% large_subset$variable),]
+plot_large <- ggplot(data = large_data, 
+                     aes(x = metadata.Phenotype, y = value)) +
+  geom_jitter(aes(color = metadata.Phenotype, 
+                  fill = metadata.Phenotype), size = 1) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.4, linewidth = 0.2,
+               aes(color = 'black')) +
+  stat_summary(fun.data = mean_se, geom = "errorbar") +
+  facet_grid(. ~ variable, scales = "free_x") +  # Facet on a single x-axis
+  theme_classic() +
+  scale_color_manual(breaks = c("R", "C"), values = c('#8C02CC', '#5192C3', 'black'))+
+  scale_fill_manual(breaks = c("R", "C"), values = c('#8C02CC', '#5192C3', 'black'))+
+  labs(x = "Phenotype", y = "Percentage responding CD4 T cells") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+         legend.position = "none") +
+  # Adding p-values using annotate or geom_text
+   geom_text(data = unique(subset(large_data, !is.na(p_value))), 
+             aes(label = paste("p =", formatC(p_value, 
+                                              digits = 3, format = "f"))),
+            x = Inf, y = max(large_data$value) / 2, hjust = 1, vjust = 0.5, size = 3)
+
+pdf("your_pdf.pdf", width = 5, height = 7)
+print(plot_large)
+dev.off()
+```
+
+#Replace the list of cytokines below with the cytokines in your ICS data- that
+#should be the only change you need to make
+```{r table for cytokine combinations}
+
+# Function to process multiple strings and create a combined table
+process_strings_combined <- function(strings) {
+  cytokines <- c("CD40L", "CD107a", "IFNg", "IL2", "IL4", "IL10", "IL17", "TNF")
+  combined_table <- data.frame(Cytokine = cytokines)
+  
+  for (i in seq_along(strings)) {
+    cytokine_values <- unlist(strsplit(strings[i], "&"))
+    #don't take any blank spaces or cytokines not in input list
+    combined_string <- paste(cytokines, collapse = "|")
+    cytokine_values <- cytokine_values[which(grepl(combined_string, cytokine_values))]
+    print(cytokine_values)
+    values <- rep("+", length(cytokines))  # Initialize values for each cytokine
+    
+    for (j in 1:length(cytokine_values)) {
+      if (grepl("^!|^&!", cytokine_values[j])) {
+        values[j] <- " -"  # Update values based on patterns
+      }
+    }
+    
+    col_name <- paste(i)
+    combined_table[[col_name]] <- values
+  }
+  
+  return(combined_table)
+}
+
+# Process strings and create a combined table
+result_combined_table <- process_strings_combined(p_sig)
+
+#Small data
+
+# Process strings and create a combined table
+small_names <- as.character(unique(small_subset$variable))
+result_combined_table <- process_strings_combined(small_names)
+# Create the table grob without background lines and shades
+table_grob <- tableGrob(result_combined_table, 
+                        theme = ttheme_minimal(
+                          base_size = 8,
+                          padding = unit(c(5, 5), "mm"), # Adjust padding here
+                          core = list(bg_params = list(fill = NA)),
+                          colhead = list(bg_params = list(fill = NA)),
+                          rowhead = list(bg_params = list(fill = NA))
+                        ))
+# Arrange plot and table
+combined <- grid.arrange(plot_small, table_grob, ncol = 1,
+                         heights = c(2, 1))
+
+                         #heights = unit(c(1, 1), "null"))
+# Set up the file name
+pdf_file <- "COMPASS_sig_percentages_withTable_small_se.pdf"
+# Save the combined plot and table to a PDF file
+ggsave(pdf_file, combined, width = 8, height = 7)
+
+#Large data
+
+# Process strings and create a combined table
+large_names <- as.character(unique(large_subset$variable))
+result_combined_table <- process_strings_combined(large_names)# Create the table grob without background lines and shades
+table_grob <- tableGrob(result_combined_table, 
+                        theme = ttheme_minimal(
+                          base_size = 8,
+                          padding = unit(c(5, 5), "mm"), # Adjust padding here
+                          core = list(bg_params = list(fill = NA)),
+                          colhead = list(bg_params = list(fill = NA)),
+                          rowhead = list(bg_params = list(fill = NA))
+                        ))
+# Arrange plot and table
+combined <- grid.arrange(plot_large, table_grob, ncol = 1,
+                         heights = c(2, 1))
+
+                         #heights = unit(c(1, 1), "null"))
+# Set up the file name
+pdf_file <- "COMPASS_sig_percentages_withTable_large_se.pdf"
+# Save the combined plot and table to a PDF file
+ggsave(pdf_file, combined, width = 2.85, height = 7) 
+#Change the width proportionally to # cytokine subsets plotted, to keep width same
+#across different stimulations
+
+```
+

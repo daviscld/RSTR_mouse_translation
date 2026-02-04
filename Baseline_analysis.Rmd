@@ -1,0 +1,259 @@
+---
+title: "Baseline"
+author: "Christine Wiggins"
+date: "2024-04-23"
+output: html_document
+---
+
+```{r load}
+#library(readxl)
+#library(hablar)
+library(pheatmap)
+library(viridis)
+#library(DMwR)
+library(RColorBrewer)
+library(summarytools)
+library(ggpubr)
+library(systemsseRology)
+
+#read in data
+baseline_raw_data <- as.data.frame(read.csv("Data/Baseline_master_percentage.csv"))
+
+#take only relevant mouse strains
+baseline_raw_data <- baseline_raw_data %>% dplyr::filter(Group_RvC %in% c("RSTR", "Canonical"))
+```
+
+```{r preprocess}
+
+#rename things appropriately
+colnames(baseline_raw_data)[which(grepl("Gender", colnames(baseline_raw_data)))] <- "Sex"
+
+metadata_names <- c("Strain", "Mouse_ID", "Group_RvC", "Group_RvAll",
+                                 "Sex", "Sample_Number", "Expt", "Total_cell_count")
+metadata <- baseline_raw_data[,metadata_names]
+metadata$Group_RvC <- gsub("RSTR", "NCan", metadata$Group_RvC)
+metadata$Group_RvAll <- gsub("RSTR", "NCan", metadata$Group_RvAll)
+
+#change strain to match other data
+metadata$Strain <- gsub("/Unc|/UncJ|/GeniUncJ|/TauUnc", "", metadata$Strain)
+
+#format numerical data
+baseline_data <- baseline_raw_data[,-which(colnames(baseline_raw_data) %in% metadata_names)]
+
+#scale
+X <- suppressWarnings(as.matrix(as.data.frame(lapply(baseline_data, as.numeric))))
+X <- as.data.frame(scale(X, center = TRUE, scale = TRUE))
+
+rownames(X) <- metadata$Mouse_ID
+
+```
+
+```{r annotation}
+library(tidyr)
+library(stringr)
+
+my_colors <- list(
+  status = c("NCan" = '#8C02CC', "Canonical" = '#5192C3', "equal" = 'black'), 
+  strain = c(viridis(9))
+  )
+names(my_colors$strain) <- c("CC009", "CC024","CC039", "PWK", "CC011", "CC059", "CC001",  "B6", "CC018")
+
+#unique identifier
+identity <- metadata$Mouse_ID
+
+#Create data frame with corresponding identity, strain, and resistor status
+df_id <- data.frame(identity = metadata$Mouse_ID, 
+                    strain = factor(metadata$Strain), 
+                    status = factor(metadata$Group_RvC))
+
+df_features <- data.frame(name = colnames(X))
+df_features$label <- factor(df_features$name)
+print(df_features)
+```
+
+#LASSO PLSDA
+
+```{r PLSDA}
+
+#Set options for LASSO feature selection - 80% threshold
+opts_sel <- list(n_trials = 100, threshold = 0.8, return_count = TRUE)
+sel_features <- select_repeat(as.matrix(X), df_id$status, 
+                              selector = select_lasso, 
+                              options = opts_sel)
+X_sel <- X[, sel_features$sel_features]
+
+# Perform a PLS-DA using the selected features and plot the scores and loadings
+# Check number of latent variables and increase to 2 if <2 (for visualization purposes)
+opts_plot <- list(df_id = df_id,
+                  loading_alpha = 1, # transparency for the loadings
+                  score_alpha = 1, # transparency for the scores
+                  LV_ind = c(1,2), # which LVs to plot
+                  color_features = "status", # according to which property the features should be color-coded
+                  colors = my_colors,
+                  y_name = "status") 
+
+opts_plot2 <- list(df_features = df_features,
+                  loading_alpha = 1, # transparency for the loadings
+                  score_alpha = 1, # transparency for the scores
+                  LV_ind = c(1,2), # which LVs to plot
+                  colors = my_colors,
+                  y_name = "status")
+opts_model <- list(n_LV = 2)
+
+#first run a PCA
+model_pca <- pca_ropls(X_sel)
+ropls::getSummaryDF(model_pca)
+
+#now run a PLS-DA with the selected features only
+model <- train_ropls(X_sel, df_id$status, options = opts_model)
+ropls::getSummaryDF(model)
+plt_scores <- visualize_ropls_scores(model, df_id$status, options = opts_plot)
+print(plt_scores)
+
+#check overall loadings
+plt_loadings <- visualize_ropls_loadings(model, options = opts_plot2)
+print(plt_loadings)
+
+# set additional options required to color code enrichment in the bar plot of the loadings
+opts_plot2$X <- X_sel
+opts_plot2$y <- df_id$status
+opts_plot2$LV_ind <- 1
+opts_plot2$mark_enrichment <- TRUE
+plt_loadings_bar1 <- visualize_ropls_loadings_bar(model, options = opts_plot2)
+print(plt_loadings_bar1)
+opts_plot2$LV_ind <- 2
+plt_loadings_bar2 <- visualize_ropls_loadings_bar(model, options = opts_plot2)
+print(plt_loadings_bar2)
+
+```
+
+#Validation, Permutation Testing on Selected Features
+
+```{r Validation, Permutation of Selected Features}
+
+#again set LASSO feature selection options
+opts_sel <- list(n_trials = 100, threshold = 0.8, return_count = FALSE)
+select <- function(X, y) { return(select_repeat(X, y, selector = select_lasso, options = opts_sel)) }
+
+#Which selection method, training method, prediction method, and scoring method?
+method = list(select = select,
+              train = train_ropls,
+              predict = predict_ropls,
+              score = score_accuracy)
+
+#set options for cross-validation
+opts = list(n_folds = 5, pt_trials = 10, rf_trials = 10)
+return_vals2 <- cross_validation_unpaired(as.matrix(X), df_id$status,
+                                method, opts, n_trials = 10)
+
+#visualize
+plt <- visualize_validate(return_vals2)
+u2 <- rowMeans(sapply(return_vals2, unlist))[1]
+u2
+u3 <- rowMeans(sapply(return_vals2,unlist))
+u3
+
+#you'll need to calculate p-value yourself & not rely on the automatic one in the plot
+validation_df <- data.frame(cv = unlist(return_vals2)[which(names(unlist(return_vals2)) == "cv_score")])
+null_df <- data.frame(rf = unlist(return_vals2)[which(grepl("rf_scores", names(unlist(return_vals2))))],
+                  pt = unlist(return_vals2)[which(grepl("pt_scores", names(unlist(return_vals2))))])
+
+#save CV scores
+# write.csv(validation_df, file = "crossvalidation_baseline_CanvNCan_newest.csv")
+# write.csv(null_df, file = "null_baseline_CanvNCan_newest.csv")
+
+```
+
+```{r correlated features}
+library(tidyverse)
+library(corrr)
+library(igraph)
+library(ggraph)
+library(ggrepel)
+
+#get all correlations
+tidyCors <- X %>% 
+  correlate(method = "spearman") %>% 
+  stretch()
+
+#use another package to calculate p-values & add to correlation dataframe
+tidyCors$p <- 0
+for (ind in 1:dim(tidyCors)[1]) {
+  tmp <- cor.test(X[,tidyCors$x[ind]], X[,tidyCors$y[ind]], method = "spearman", exact = FALSE)
+  tidyCors$p[ind] <- tmp$p.value
+}
+#multiple hypothesis correction
+tidyCors$p <- p.adjust(tidyCors$p, method = "BH", n = length(tidyCors$p))
+  
+plotFeatures <- colnames(X_sel)
+
+#take only features significantly correlated with selected features
+sigCors <- tidyCors %>% 
+  filter(p < 0.01 & (is.element(x, plotFeatures) | is.element(y, plotFeatures))
+         & abs(r) > 0.8)
+```
+
+
+```{r heatmap}
+#Display heatmap of the z-scored data indicating mouse status
+
+my_colors <- list(
+  status = c("NCan" = '#8C02CC', "Canonical" = '#5192C3', "equal" = 'black'), strain = c(viridis(9))
+  )
+names(my_colors$strain) <- c("CC009", "CC024","CC039", "PWK", "CC011", "CC059", "CC001",  "B6", "CC018")
+
+#get features correlated with selected feature also
+keep <- unique(c(colnames(X_sel), unique(c(sigCors$x, sigCors$y))))
+
+long_X <- reshape2::melt(cbind(metadata, X[,keep]), id.vars = metadata_names)
+
+# Average values by mouse strain
+library(dplyr)
+averaged_df <- long_X %>%
+  group_by(Strain, variable, Group_RvC) %>%
+  summarise(Average_Value = mean(value))
+
+averaged_df_wide <- reshape2::dcast(averaged_df, Strain + Group_RvC ~ variable) %>%
+  arrange(Group_RvC)
+
+#Annotate row by strain & phenotype
+annotation_row = data.frame(status = as.factor(averaged_df_wide$Group_RvC), 
+                            strain = as.factor(averaged_df_wide$Strain))
+rownames(averaged_df_wide) <- averaged_df_wide$Strain
+rownames(annotation_row) <- rownames(averaged_df_wide)
+
+#Annotate column by cell type/immune function
+annotation_col <- data.frame(feature = keep)
+annotation_col$Category <- rep("other", length(keep))
+annotation_col$Category[which(grepl("B_", annotation_col$feature))] <- "B cells"
+annotation_col$Category[which(grepl("CD4_", annotation_col$feature))] <- "CD4"
+annotation_col$Category[which(grepl("CD8_", annotation_col$feature))] <- "CD8"
+annotation_col$Category[which(grepl("DC_", annotation_col$feature))] <- "DC"
+annotation_col$Category[which(grepl("Mac", annotation_col$feature))] <- "Macrophage"
+annotation_col$Category[which(grepl("CD19n", annotation_col$feature))] <- "Myeloid"
+annotation_col$Category[which(grepl("B", annotation_col$feature))] <- "B cells"
+annotation_col$Category <- as.factor(annotation_col$Category)
+
+rownames(annotation_col) <- annotation_col$feature
+
+#heatmap
+plt <- pheatmap(as.matrix(averaged_df_wide[,-c(1,2)]), 
+         annotation_colors = my_colors, 
+         annotation_row = annotation_row, 
+         annotation_col = annotation_col,
+         cluster_cols = TRUE,
+         cluster_rows = FALSE,
+         clustering_distance_rows = "euclidian",
+         cellwidth = 4, 
+         cellheight = 8, 
+         fontsize = 5, 
+         border_color = "NA", 
+         treeheight_row = 3, 
+         treeheight_col = 3,
+         cex = 1
+         )
+
+#save data
+#write.xlsx(averaged_df_wide, "heatmap_baseline.xlsx")
+
+```

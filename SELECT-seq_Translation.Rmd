@@ -1,0 +1,983 @@
+---
+title: "SELECT-seq Translation"
+author: "Christine Wiggins"
+date: "2024-02-20"
+output: html_document
+---
+
+#Clear workspace & setup
+```{r setup, include=FALSE}
+rm(list = ls()) #clear workspace
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#Load packages
+```{r package load}
+#general function packages
+#library(readxl)
+library(openxlsx)
+library(summarytools)
+library(tidyverse)
+library(dplyr)
+#plotting packages
+library(ggplot2)
+library(ggsignif)
+library(ggExtra)
+library(ggbreak) 
+library(ggbeeswarm)
+library(ggrepel)
+library(viridis)
+library(RColorBrewer)
+library(pheatmap)
+#single-cell packages
+library(Seurat)
+library(limma)
+#misc modeling packges
+library(systemsseRology)
+library(ropls)
+library(caret)
+library(lsr)
+library(STRINGdb)
+library(dplyr)
+library(ggpubr)
+```
+
+#Load data
+```{r data load}
+#full human CD4 load data from Sun et al paper (will need to generate yourself)
+seurat_human <- readRDS("/Data/TB_RSTR_PP1_CD4_Seurat_object.rds")
+seurat_human <- SetIdent(seurat_human, value = seurat_human@meta.data$Group)
+
+#Load preprocessed mouse CITEseq object with T cell annotations
+#will need to generate yourself
+seurat_mouse <- readRDS("/Data/immune_combined_Tcell_annotated.RDS")
+
+#Take only CD4 to match human
+seurat_mouse <- subset(seurat_mouse, subset = Tcell.ident %in% c("CD4_naive1", "CD4_act2","CD4_naive2", "CD4_act1","CD4_Treg","CD4_IFN"))
+
+seurat_mouse@meta.data[["Tcell.ident"]] <- droplevels(seurat_mouse@meta.data[["Tcell.ident"]])
+
+```
+
+#Conversion function
+```{r convert genes}
+convert_mouse_to_human <- function(gene_list) { 
+     output = c()
+     mouse_human_genes = read.csv("https://www.informatics.jax.org/downloads/reports/HOM_MouseHumanSequence.rpt",sep="\t")
+
+     for(gene in gene_list) {
+          class_key = (mouse_human_genes %>% dplyr::filter(Symbol == gene & Common.Organism.Name == "mouse, laboratory"))[['DB.Class.Key']]
+          if( !identical(class_key, integer(0)) ) {
+               human_genes = (mouse_human_genes %>% dplyr::filter(DB.Class.Key == class_key & Common.Organism.Name=="human"))[,"Symbol"]
+               for(human_gene in human_genes) {
+                    output = rbind(c(gene, human_gene), output)
+               }
+          }
+     }
+     return (output)
+}
+
+convert_human_to_mouse <- function(gene_list) {
+    output = c()
+    mouse_human_genes = read.csv("https://www.informatics.jax.org/downloads/reports/HOM_MouseHumanSequence.rpt",sep="\t")
+
+    for(gene in gene_list) {
+          class_key = (mouse_human_genes %>% dplyr::filter(Symbol == gene & Common.Organism.Name == "human"))[['DB.Class.Key']]
+          if( !identical(class_key, integer(0)) ) {
+            human_genes = (mouse_human_genes %>% dplyr::filter(DB.Class.Key == class_key & Common.Organism.Name=="mouse, laboratory"))[,"Symbol"]
+            for(human_gene in human_genes) {
+                output = rbind(c(gene, human_gene), output)
+            }
+          }
+     }
+     return (output)
+}
+```
+
+#DEGS between RSTR/NCan & LTBI/canonical cells
+```{r non pseudobulked DEGs}
+# Filter genes with one-to-one orthologs
+
+#uncomment this the first time you run, so you can generate a dictionary of
+#orthologous genes
+#orthologs_df <- as.data.frame(convert_human_to_mouse(rownames(RSTR_CD4@assays$RNA@counts)))
+#saveRDS(orthologs_df, "orthologs_df")
+
+orthologs_df <- readRDS("/R Markdowns/orthologs_df")
+colnames(orthologs_df) <- c("Human_Gene", "Mouse_Gene")
+
+# Filter mouse genes for orthologs
+mouse_orthologs <- rownames(seurat_mouse@assays$RNA@counts)[which(rownames(seurat_mouse@assays$RNA@counts)%in% orthologs_df$Mouse_Gene)] 
+seurat_mouse <- seurat_mouse[rownames(seurat_mouse) %in% mouse_orthologs,]
+seurat_mouse$celltype.stim <- paste(seurat_mouse$group, seurat_mouse$Tcell.ident, sep = "_")
+Idents(seurat_mouse) <- "celltype.stim"
+
+# Filter human genes for orthologs
+human_orthologs <- rownames(seurat_human@assays[["RNA"]]@counts)[which(rownames(seurat_human@assays[["RNA"]]@counts) %in% orthologs_df$Human_Gene)] 
+seurat_human <- seurat_human[rownames(seurat_human) %in% human_orthologs,]
+
+# run sctransform on human data because mouse data already normalized
+seurat_human <- SCTransform(seurat_human, verbose = FALSE)
+
+#now get all DEGs between NCan & Canonical mice
+Idents(seurat_mouse) <- "group"
+subset <- PrepSCTFindMarkers(object = seurat_mouse)
+overall_de_mouse <- FindMarkers(object = subset, 
+                           ident.1 = "RSTR", 
+                           ident.2 = "Canonical",
+                           test.use = "wilcox",
+                        recorrect_umi=FALSE)
+overall_de_mouse$p_adj_BH <- p.adjust(overall_de_mouse$p_val)
+overall_de_mouse <- filter(overall_de_mouse, p_adj_BH < 0.05)
+
+#now all DEGs between NCan & Canonical humans
+Idents(seurat_human) <- "Group"
+overall_de_human <- FindMarkers(object = seurat_human, 
+                           ident.1 = "RSTR", 
+                           ident.2 = "LTBI",
+                           test.use = "wilcox")
+overall_de_human$p_adj_BH <- p.adjust(overall_de_human$p_val)
+overall_de_human <- filter(overall_de_human, p_adj_BH < 0.05)
+
+keep_genes <- c(unique(rownames(overall_de_human)),
+                convert_mouse_to_human(unique(rownames(overall_de_mouse))))
+#saveRDS(keep_genes, "nonbulk_keep_genes_newest")
+
+#some of the pvalues are too small for R to even save, so replace them with the
+#machine minimum
+machine_min_p <- .Machine$double.xmin
+overall_de_mouse$p_adj_BH[which(overall_de_mouse$p_adj_BH == 0)] <- machine_min_p
+overall_de_human$p_adj_BH[which(overall_de_human$p_adj_BH == 0)] <- machine_min_p
+
+#saveRDS(overall_de_mouse, "nonbulk_overall_mouse_DEGs_newest")
+#saveRDS(overall_de_human, "nonbulk_overall_human_DEGs_newest")
+
+#Start from here if redoing analysis
+#overall_de_human <- readRDS("nonbulk_overall_human_DEGs_newest")
+#overall_de_mouse <- readRDS("nonbulk_overall_mouse_DEGs_newest")
+```
+
+#DEG volcano plot
+```{r volcano}
+overall_de_human <- as.data.frame(overall_de_human[,c("avg_log2FC","p_adj_BH")])
+overall_de_human$gene <- rownames(overall_de_human)
+overall_de_mouse <- as.data.frame(overall_de_mouse[,c("avg_log2FC","p_adj_BH")])
+gene_replacement <- convert_mouse_to_human(rownames(overall_de_mouse))
+
+#remove pseudogenes that are left
+gene_replacement <- gene_replacement[-which(gene_replacement[,2] %in% c("IFITM3", "HSP90AB2P","HSP90AB3P","HSP90AB4P","HBA2","FABP5P3","FBXW10B","CR1L")),]
+
+# Get the corresponding row indices in `gene_replacement`
+indices <- match(rownames(overall_de_mouse), gene_replacement[,1])
+
+# Order `gene_replacement` based on the indices
+gene_replacement_ordered <- gene_replacement[indices, ]
+overall_de_mouse$gene <- as.character(gene_replacement_ordered[,2])
+
+# Merge the dataframes based on gene names
+merged_df <- rbind(overall_de_human, overall_de_mouse)
+merged_df$species <- c(rep("human", nrow(overall_de_human)),
+                       rep("mouse", nrow(overall_de_mouse)))
+
+# Filter the dataframe for mouse data
+mouse_data <- merged_df[merged_df$species == "mouse", ]
+human_data  <- merged_df[merged_df$species == "human", ]
+
+# Define significance threshold (adjust as needed)
+significance_threshold <- 0.05
+
+# Determine which genes are in both mouse and human datasets
+common_genes <- mouse_data$gene[which(mouse_data$gene %in% human_data$gene)]
+
+# Top 20 most differentially expressed human genes
+top_human_genes <- human_data[order(-abs(human_data$avg_log2FC)), ]
+top_human_genes <- top_human_genes[which(top_human_genes$gene %in% common_genes),]
+top_human_genes <- top_human_genes[1:40,]
+
+# Plot the volcano plot
+plt <- ggplot(mouse_data, aes(x = avg_log2FC, y = -log10(p_adj_BH))) +
+  geom_point(data = mouse_data[-which(mouse_data$gene %in% common_genes), ],
+             aes(shape = ifelse(p_adj_BH < 0.05 & abs(avg_log2FC) > 0.5, 
+                                "Mouse Significant", "Mouse Not Significant")),
+             color = "black", fill = "white", size = 3, alpha = 0.3) +  
+  geom_point(data = mouse_data[which(mouse_data$gene %in% common_genes), ],
+             aes(shape = ifelse(p_adj_BH < 0.05 & abs(avg_log2FC) > 0.5, 
+                                "Mouse Significant", "Mouse Not Significant")),
+             fill = "lightblue", size = 3, alpha = 1) +
+  scale_shape_manual(values = c("Mouse Significant" = 23, 
+                                "Mouse Not Significant" = 1),
+                     name = "") +
+  geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed", color = "gray") +
+  geom_hline(yintercept = -log10(significance_threshold), 
+             linetype = "dashed", color = "gray") +
+  labs(x = "Log2 Fold Change", y = "-log10(Adjusted p-value)", 
+       title = "Volcano Plot for Mouse Data") +
+  theme_minimal() +
+  ylim(0,-log10(machine_min_p)+10) +
+  geom_text_repel(data = mouse_data[mouse_data$gene %in% top_human_genes$gene, ],
+                  aes(label = gene), size = 3, nudge_x = 0.2, nudge_y = 0.2, color = "black", max.overlaps = 40)
+
+# pdf("volcano_plot_mouse_human_DEGs.pdf", width = 8, height = 5)
+# print(plt)
+# dev.off()
+
+#save data
+#mouse_data$human_sig <- mouse_data$gene %in% common_genes
+#write.xlsx(mouse_data, "volcano_plot_data.xlsx")
+
+```
+
+#Load PCA code (from SystemsseRology package, by Carolin Loos)
+```{r}
+#' PCA using ropls
+#'
+#' @param X n_samples x n_features matrix
+#' @return ropls object
+#'
+#' @export
+pca_ropls <- function(X) {
+  # suppress annoying "error"s from ropls
+  #sink(file = tempfile())
+    try_out <- try(
+      model <- ropls::opls(X, predI = NA,
+                           #crossValI = 5, # TODO make this an option
+                           permI = 0, # no permutation and other output to save computation time
+                           info.txtC = "none",
+                           fig.pdfC = "none"#,
+                           #silent = TRUE
+                           )
+    )
+    if (is(try_out, "try-error") | ropls::getSummaryDF(model)$pre < 2) {
+      # to ensure that the model has at least two prinicipal components
+      model <- ropls::opls(X, predI = 2,
+                           #crossValI = 5,
+                           permI = 0,
+                           info.txtC = "none",
+                           fig.pdfC = "none"#,
+                           #silent = TRUE
+                           )
+    }
+  #sink()
+  return(model)
+}
+
+```
+
+#TransCompR
+```{r transcompr}
+#pull metadata
+meta_h <- seurat_human@meta.data
+meta_m <- seurat_mouse@meta.data
+meta_m$sample_ID <- paste0(meta_m$sample_ID, "_", seq(1,nrow(meta_m)))
+
+#overall_de_human <- readRDS("nonbulk_overall_human_DEGs_newest")
+#overall_de_mouse <- readRDS("nonbulk_overall_mouse_DEGs_newest")
+
+orthologs_df <- readRDS("/Users/christinedavis/Documents/GitHub/Rep1/Sassetti TB collaboration/R Markdowns/orthologs_df")
+colnames(orthologs_df) <- c("Human_Gene", "Mouse_Gene")
+
+#Get human DEGs from human data
+X <- seurat_human@assays[["RNA"]]@scale.data
+X <- X[rownames(X) %in% orthologs_df$Human_Gene,]
+X <- t(X)
+X <- X[,which(colnames(X) %in% rownames(overall_de_human))]
+
+#get human DEGS from mouse data
+seurat_mouse <- Seurat::ScaleData(seurat_mouse)
+X2 <- GetAssayData(seurat_mouse, slot = "scale.data")
+X2 <- X2[rownames(X2) %in% orthologs_df$Mouse_Gene,]
+X2 <- t(X2)
+
+# Subset to only include the first instance of each mouse_gene
+unique_mouse_genes <- convert_mouse_to_human(colnames(X2))
+colnames(unique_mouse_genes) <- c("mouse_genes", "human_genes")
+unique_mouse_genes <- as.data.frame(unique_mouse_genes) %>% distinct(mouse_genes, .keep_all = TRUE)
+unique_mouse_genes <- as.data.frame(unique_mouse_genes) %>% distinct(human_genes, .keep_all = TRUE)
+
+# Create a named vector for renaming
+name_vector <- setNames(unique_mouse_genes$mouse_genes, unique_mouse_genes$human_genes)
+
+# Rename columns in the datasheet
+X2 <- as.data.frame(X2) %>%
+  rename(!!!name_vector)
+X2 <- as.matrix(X2)
+
+X3 <- X2[,which(colnames(X2) %in% rownames(overall_de_human))]
+
+X <- X[,which(colnames(X) %in% colnames(X3))]
+
+#something weird going on with these two cells
+meta_h <- meta_h[-which(rownames(meta_h) %in% c("CP6_G07","CP4_D01")),]
+X <- X[-which(rownames(X) %in% c("CP6_G07","CP4_D01")),]
+
+#Build PCA on human data
+h_pca_ropls <- ropls::opls(X, predI = 20)
+h_PC_loadings <- as.data.frame(getLoadingMN(h_pca_ropls))
+h_PC_scores <- as.data.frame(getScoreMN(h_pca_ropls))
+h_PC_scores_plt <- as.data.frame(h_PC_scores)
+h_PC_scores_plt$status <- as.factor(meta_h$Group)
+
+my_colors <- list(
+  status = c("RSTR" = '#8C02CC', "Canonical" = '#5192C3', "equal" = 'black',
+             "LTBI" = '#5192C3'))
+
+df_id <- data.frame(meta_h)
+df_features <- data.frame(name = colnames(X))
+df_features$label <- df_features$name
+
+opts_plot <- list(df_features = df_id,
+                  loading_alpha = 1, # transparency for the loadings
+                  score_alpha = 0.5, # transparency for the scores
+                  LV_ind = c(1,2), # which LVs to plot
+                  n_LV = 2,
+                  size = 3,
+                  color_features = "status", 
+                  colors = my_colors,
+                  #level = 0, #ellipse confidence
+                  y_name = "status") 
+opts_plot2 <- list(df_features = df_features,
+                  loading_alpha = 1, # transparency for the loadings
+                  score_alpha = 1) 
+
+# Perform a simple PCA (this is just better to visualize than the one before)
+model_pca <- pca_ropls(X)
+ropls::getSummaryDF(model_pca)
+plt_scores_pca <- visualize_ropls_scores(model_pca, meta_h$Group, options = opts_plot)
+print(plt_scores_pca)
+
+# pdf("human_pca_DEGs.pdf", height = 3, width = 3)
+# print(plt_scores_pca)
+# dev.off()
+
+#plot human PCA scores
+hPC_plt <- ggplot(h_PC_scores_plt, 
+                  aes(x = p1, y = p2, color = status)) +
+  scale_color_manual(values = my_colors$status) +
+  geom_point(size = 2) +
+  theme_classic()
+
+#order mouse genes in human PC loadings order
+X3 <- X3[,rownames(h_PC_loadings)]
+
+#project in mouse scores
+m_PC_scores <- as.matrix(X3) %*% as.matrix(h_PC_loadings)
+rownames(m_PC_scores) <- meta_m$sample_ID
+
+m_PC_scores_plt <- as.data.frame(m_PC_scores)
+m_PC_scores_plt$status <- as.factor(meta_m$group)
+
+#plot mouse PCA scores
+m_PC_scores_plt_2 <- m_PC_scores_plt
+m_PC_scores_plt_2$status <- gsub("RSTR", "NCan", m_PC_scores_plt_2$status)
+my_colors_2 <- my_colors
+names(my_colors_2$status) <- gsub("RSTR", "NCan", names(my_colors_2$status))
+
+mPC_plt <- ggplot(m_PC_scores_plt_2, aes(x = p1, y = p2, color = status)) +
+  scale_color_manual(values = my_colors_2$status) +
+  geom_point(size = 2) +
+  theme_classic()
+print(mPC_plt)
+
+# pdf("mouse_projected_pca.pdf", height = 3, width = 4)
+# print(mPC_plt)
+# dev.off()
+
+#save data
+#write.xlsx(h_PC_scores_plt, "human_PC_scores.xlsx")
+#write.xlsx(m_PC_scores_plt, "mouse_PC_scores.xlsx")
+```
+
+#Calculate mouse and human variance (variance of model captured per PC)
+```{r model variance}
+#human - calculate variance per PC
+eigs <- apply(h_pca_ropls@scoreMN, 2, sd)^2
+var <- data.frame(variance = (eigs[1:20] / sum(eigs[1:20]) * 100))
+var$names <- rownames(var)
+var$names <- factor(var$names, levels = var$names)
+
+#save data
+#write.xlsx(var, "human_variance.xlsx")
+
+plt_human <- ggplot(var, aes(x = names, y = variance)) +
+  geom_col(fill = 'darkgoldenrod1') +
+  xlab("hPC") +
+  ylab("% variance") +
+  theme_classic()
+
+#mouse - calculate variance per PC
+eigs <- apply(m_PC_scores, 2, sd)^2
+var <- data.frame(variance = (eigs[1:20] / sum(eigs[1:20]) * 100))
+var$names <- rownames(var)
+var$names <- factor(var$names, levels = var$names)
+
+#save data
+#write.xlsx(var, "mouse_variance.xlsx")
+
+plt_mouse <- ggplot(var, aes(x = names, y = variance)) +
+  geom_col(fill = 'deeppink4') +
+  xlab("mPC") +
+  ylab("% variance") +
+  theme_classic()
+
+# pdf("human_variance.pdf", height = 4, width = 7)
+# print(plt_human)
+# dev.off()
+# pdf("mouse_variance.pdf", height = 4, width = 7)
+# print(plt_mouse)
+# dev.off()
+
+```
+
+#Calculate total human variance (variance of total data captured per PC)
+```{r data variance}
+#change n_pcs to match actual pcs used
+n_pcs <- 20
+
+var_pca_ropls <- ropls::opls(X, predI = n_pcs)
+fun <- function(x) var_pca_ropls@modelDF$R2X[x]
+var_df <- data.frame(pc = seq(1,n_pcs,1))
+var_df$variance <- sapply(var_df$pc, fun)
+var_df$variance <- var_df$variance*100
+cumsum(var_df$variance)
+```
+
+#Cohen's D for comparing importance of human & mouse PCs in identifying phenotype
+```{r Cohen's D}
+#make empty df
+cohen_df <- data.frame(NA, NA, NA, NA)
+colnames(cohen_df) <- c("PC","measurement","species","value")
+
+#loop though species & PCs and get Cohen's D for each PC (per status/phenotype)
+for (species in c("mouse","human")){
+  if (species == "human"){
+    subset_hPCs <- h_PC_scores_plt
+     i = 0
+     for (pc in colnames(h_PC_scores_plt)[1:(ncol(h_PC_scores_plt)-1)]){
+         i = i+1
+         cohen <- cohensD(subset_hPCs[,i] ~ status, data = subset_hPCs)
+         #save values
+         cohen_tmp <- data.frame(PC=c(pc),
+                                 measurement = c("Cohen's D"),
+                                 species = c(species),
+                                 value = c(cohen))
+         cohen_df <- rbind(cohen_tmp, cohen_df)
+     }
+  }
+  if (species == "mouse"){
+    subset_mPCs <- m_PC_scores_plt[which(meta_m$Tcell.ident == "CD4_act1"),]
+    i = 0
+    for (pc in colnames(m_PC_scores_plt)[1:(ncol(m_PC_scores_plt)-1)]){
+      i = i+1
+      cohen <- cohensD(subset_mPCs[,i] ~ status, data = subset_mPCs)
+      #save values
+      cohen_tmp <- data.frame(PC=c(pc),
+                            measurement = c("Cohen's D"),
+                            species = c(species),
+                            value = c(cohen))
+      cohen_df <- rbind(cohen_tmp, cohen_df)
+    }
+  }
+}
+#clean up df for plotting
+cohen_df <- cohen_df[-which(is.na(cohen_df$PC)),]
+cohen_df$PC <- gsub("p","", cohen_df$PC)
+cohen_df$PC <- as.factor(cohen_df$PC)
+cohen_df$species <- as.factor(cohen_df$species)
+cohen_df$value <- as.numeric(cohen_df$value)
+
+#reorder and plot
+pc_order <- unique(sort(as.numeric(cohen_df$PC)))
+cohen_plt <- ggplot(cohen_df, aes(x = factor(cohen_df$PC, levels = pc_order), 
+                                  y = value,
+                                  fill = species))+
+  geom_bar(position = "dodge", stat = "identity") +
+  scale_fill_manual(values = c("human" = "darkgoldenrod1", 
+                               "mouse" = "deeppink4")) +
+  scale_y_break(c(0.4, 1.8)) + 
+  geom_hline(yintercept = 0.2, linetype = 2) +
+  ylab("Cohen's D Value") +
+  xlab("hPC") +
+  theme_classic()
+
+# pdf("Cohens_D.pdf", height = 4, width = 5)
+# print(cohen_plt)
+# dev.off()
+
+#save data
+#write.xlsx(cohen_df, "cohens_d.xlsx")
+
+#pull significant coefs
+m_sig_coefs <- cohen_df$PC[which(cohen_df$species == "mouse" & cohen_df$value >= 0.2)]
+m_sig_coefs <- paste0("p", m_sig_coefs)
+
+h_sig_coefs <- cohen_df$PC[which(cohen_df$species == "human" & cohen_df$value >= 0.2)]
+h_sig_coefs <- paste0("p", h_sig_coefs)
+
+```
+
+#Heatmap for hPC scores by phenotype/species
+```{r compare hPC scores by phenotype, species}
+#Quantile breaks function for visualization
+quantile_breaks <- function(xs, n = 10) {
+  breaks <- quantile(xs, 
+                     probs = seq(0, 1, length.out = n),
+                     na.rm = T)
+  breaks[!duplicated(breaks)]
+}
+
+#average values of PC scores
+for (species in c("mouse","human")){
+  if (species == "mouse"){
+    df <- reshape2::melt(m_PC_scores_plt)
+  } else {
+    df <- reshape2::melt(h_PC_scores_plt)
+    df$status <- plyr::revalue(df$status, c("LTBI" = "Canonical", "RSTR" = "RSTR"))
+  }
+  # Calculate mean values for each group and each column
+  mean_values <- df %>%
+    group_by(status, variable) %>%
+    summarise(mean_value = mean(value, na.rm = TRUE), .groups = 'drop') %>%
+    pivot_wider(names_from = status, values_from = mean_value)
+  mean_values$species <- rep(species, nrow(mean_values))
+  assign(paste0("mean_values_", species), mean_values)
+}
+
+#format dataframe for plotting
+mean_values <- rbind(mean_values_mouse, mean_values_human)
+mean_values_melted <- reshape2::melt(mean_values, id.vars = c("variable",
+                                                              "species"))
+colnames(mean_values_melted) <- c("PC","species","phenotype","value")
+mean_values_melted$group <- paste0(mean_values_melted$species, "_", 
+                            mean_values_melted$phenotype)
+mean_values_unmelted <- reshape2::dcast(mean_values_melted, PC ~ group)
+
+#calculate quantile breaks
+mat_breaks <- quantile_breaks(mean_values_melted$value[-which(abs(mean_values_melted$value) > 2)], n = 101)
+
+#order factors
+mean_values_unmelted <- mean_values_unmelted[,c("PC","human_Canonical", "mouse_Canonical",
+                                                "human_RSTR","mouse_RSTR")]
+rownames(mean_values_unmelted) <- mean_values_unmelted$PC
+
+#white-out not significant PCs
+human_ind <- which(grepl("human", colnames(mean_values_unmelted)))
+mouse_ind <- which(grepl("mouse", colnames(mean_values_unmelted)))
+
+mean_values_unmelted[which(!mean_values_unmelted$PC %in% h_sig_coefs), human_ind] <- 0
+mean_values_unmelted[which(!mean_values_unmelted$PC %in% m_sig_coefs), mouse_ind] <- 0
+
+colnames(mean_values_unmelted) <- gsub("mouse_RSTR", "mouse_NCan",
+                                       colnames(mean_values_unmelted))
+
+plt_heat <- pheatmap(mean_values_unmelted[,2:ncol(mean_values_unmelted)],
+              color = rev(colorRampPalette(brewer.pal(n = 11, 
+                                                      name = "RdBu"))(100)),
+              cluster_cols = F, cluster_rows = F,
+              cellwidth = 20, cellheight = 10, fontsize = 12, 
+              breaks = mat_breaks,
+              border_color = "NA", treeheight_row = 0, 
+              treeheight_col = 0)
+
+# pdf("Avg_value_PCs.pdf", width = 4, height = 6)
+# print(plt_heat)
+# dev.off()
+
+#save data
+#write.xlsx(mean_values_unmelted[,2:ncol(mean_values_unmelted)], "pc_heatmap.xlsx")
+
+```
+
+#subset to CD4_act1 for model predictions
+```{r CD4_act1 subset}
+#for all future analysis, we will only use CD4_act1 from mice
+Idents(object = seurat_mouse) <- "Tcell.ident"
+seurat_mouse <- subset(seurat_mouse, idents = c("CD4_act1"))
+
+#do only for CD4_act1
+m_PC_scores_CD4act1 <- m_PC_scores[which(meta_m$Tcell.ident == "CD4_act1"),]
+meta_CD4act1 <- meta_m[which(meta_m$Tcell.ident == "CD4_act1"),]
+```
+
+#train linear discriminant analysis (LDA) model to predict phenotype
+```{r}
+pred_list <- list(coefs = list(), 
+                  name = list(),
+                  round = list())
+
+#Set training parameters
+control <- trainControl(method = "repeatedcv", number = 5, sampling = "down",
+                        repeats = 10, savePredictions = T)
+performance_metric <- "Accuracy"
+
+#remove mouse 29, which has too few cells
+mPCs <- m_PC_scores[-which(grepl("CC024_29", meta_m$orig.ident)),]
+meta_m_tmp <- meta_m[-which(grepl("CC024_29", meta_m$orig.ident)),]
+
+for (subset in c("CD4_act1")){ #sort of irrelevant to loop
+  #for each mouse
+  for (mouse in unique(meta_m_tmp$orig.ident)){
+    X_subset <- mPCs
+    #split dataset into train and test (train = all but one mouse, 
+    #test = that mouse)
+    train_ind <- which(meta_m_tmp$Tcell.ident == subset & meta_m_tmp$orig.ident != mouse)
+    test_ind <- which(meta_m_tmp$Tcell.ident == subset & meta_m_tmp$orig.ident == mouse)
+    X_train <- as.data.frame(X_subset[train_ind,])
+    X_train$phenotype <- as.factor(meta_m_tmp$group[train_ind])
+    
+    X_test <- as.data.frame(X_subset[test_ind,])
+    X_test$phenotype <- as.factor(meta_m_tmp$group[test_ind])
+    
+    #10 round 5-fold CV
+  for (rep in seq(1,100)){
+    mod_real <- train(phenotype ~ p20 + p18 + p6 + p13, data = X_train, method = "lda",
+               metric = performance_metric, trControl = control)
+    coefs <- mod_real[["finalModel"]][["scaling"]]
+    #save cell predictions
+    pred_list$coefs <- append(pred_list$coefs, coefs)
+    pred_list$name <- append(pred_list$name, c("p20","p18","p6","p13"))
+    pred_list$round <- append(pred_list$round, rep(rep, 4))
+    print(rep)
+  }
+  }
+}
+
+####### accuracy of per mouse predictions ###########################
+  
+#save CV values
+cv_df <- data.frame(coefs = unlist(pred_list$coefs),
+                    name = unlist(pred_list$name),
+                    round = unlist(pred_list$round))
+
+```
+
+#Comparison to permuted labels and random features - cross-validation
+#Also what % of cells are correctly classified per mouse?
+```{r combined CV & models}
+#need to leave entire mice out in CV instead of just cell folds
+#leave-one-mouse-out
+pred_list <- list(subset = list(), 
+                  mouse = list(),
+                  prediction = list(),
+                  random = list(),
+                  shuff = list())
+
+#save predictions for each cell as well
+pred_list_cell <- list(mouse = list(),
+                  round = list(),
+                  cell = list(),
+                  prediction = list())
+
+#Set training parameters
+control <- trainControl(method = "repeatedcv", number = 5, sampling = "down",
+                        repeats = 10, savePredictions = T)
+performance_metric <- "Accuracy"
+
+mPCs <- m_PC_scores[-which(grepl("CC024_29", meta_m$orig.ident)),]
+meta_m_tmp <- meta_m[-which(grepl("CC024_29", meta_m$orig.ident)),]
+
+for (subset in c("CD4_act1")){ #unique(meta_m_tmp$Tcell.ident)){
+  for (mouse in unique(meta_m_tmp$orig.ident)){
+    X_subset <- mPCs
+    train_ind <- which(meta_m_tmp$Tcell.ident == subset & meta_m_tmp$orig.ident != mouse)
+    test_ind <- which(meta_m_tmp$Tcell.ident == subset & meta_m_tmp$orig.ident == mouse)
+    X_train <- as.data.frame(X_subset[train_ind,])
+    X_train$phenotype <- as.factor(meta_m_tmp$group[train_ind])
+    
+    X_test <- as.data.frame(X_subset[test_ind,])
+    X_test$phenotype <- as.factor(meta_m_tmp$group[test_ind])
+    
+    #10 round 5-fold CV
+  for (rep in seq(1,100)){
+    mod_real <- train(phenotype ~ p20 + p18 + p6 + p13, data = X_train, method = "lda",
+               metric = performance_metric, trControl = control)
+    pred_mouse <- predict(mod_real, X_test)
+    #save cell predictions
+    pred_list_cell$prediction <- append(pred_list_cell$prediction, pred_mouse)
+    pred_list_cell$cell <- append(pred_list_cell$cell, rownames(X_test))
+    pred_list_cell$round <- append(pred_list_cell$round, rep(rep, length(pred_mouse)))
+    
+    #classify mouse as canonical or rstr
+    if (length(pred_mouse[which(as.character(pred_mouse) == "RSTR")])/length(pred_mouse) > 0.5){
+    pred_list$prediction <- append(pred_list$prediction, "RSTR")
+    } else {
+      pred_list$prediction <- append(pred_list$prediction, "Canonical")
+    }
+  }
+    pred_list_cell$mouse <- append(pred_list_cell$mouse, rep(mouse, 100*length(pred_mouse)))
+    pred_list$mouse <- append(pred_list$mouse, rep(mouse, 100))
+  #shuffled label model
+    for (rep in seq(1,100)){
+      perm <- sample(1:nrow(X_train))
+      pt_shuf <- X_train[,1:(ncol(X_train)-1)]
+      pt_shuf$phenotype <- as.factor(X_train$phenotype)[perm]
+      mod_shuffled <- train(phenotype ~ p20 + p18 + p6 + p13, data = pt_shuf, method = "lda",
+                  metric = performance_metric, trControl = control)
+      #use shuffled model to predict mouse
+      pred_shuff_mouse <- predict(mod_shuffled, X_test)
+      
+      #classify mouse as canonical or rstr
+      if (length(pred_shuff_mouse[which(as.character(pred_shuff_mouse) == "RSTR")])/length(pred_shuff_mouse) > 0.5){
+      pred_list$shuff <- append(pred_list$shuff, "RSTR")
+      } else {
+        pred_list$shuff <- append(pred_list$shuff, "Canonical")
+      }
+    }
+      pred_list$subset <- append(pred_list$subset, rep(subset, 100))
+    #random features model
+    for (rep in seq(1,100)){
+      # Randomly select same # features as real, but excluding real ones
+      unselected_features <- colnames(X_train)[-which(colnames(X_train) %in% c(m_sig_coefs,
+                                                                               "phenotype"))]
+      selected_features <- sample(unselected_features, length(m_sig_coefs))
+    
+      # Construct the formula
+      formula <- as.formula(paste("phenotype ~", paste(selected_features, collapse = " + ")))
+      
+      # Train the LDA model with the random features
+      mod_random <- train(formula, data = X_train, method = "lda", 
+                          metric = performance_metric, trControl = control)
+    
+      #use shuffled model to predict mouse
+      pred_rf_mouse <- predict(mod_random, X_test)
+      
+      #classify mouse as canonical or rstr
+      if (length(pred_rf_mouse[which(as.character(pred_rf_mouse) == "RSTR")])/length(pred_rf_mouse) > 0.5){
+      pred_list$random <- append(pred_list$random, "RSTR")
+      } else {
+        pred_list$random <- append(pred_list$random, "Canonical")
+      }
+    }
+  }
+}
+
+####### accuracy of per mouse predictions ###########################
+  
+#plot CV values
+cv_df <- data.frame(subset = unlist(pred_list$subset),
+                    mouse = unlist(pred_list$mouse),
+                    prediction = unlist(pred_list$prediction),
+                    random = unlist(pred_list$random),
+                    shuff = unlist(pred_list$shuff))
+
+cv_df$real <- rep(NA, nrow(cv_df))
+cv_df$real[which(grepl("B6", cv_df$mouse))] <- "Canonical"
+cv_df$real[which(grepl("CC024", cv_df$mouse))] <- "RSTR"
+cv_df$real[which(grepl("PWK", cv_df$mouse))] <- "RSTR"
+cv_df$real[which(grepl("CC011", cv_df$mouse))] <- "Canonical"
+
+#save data
+#write.xlsx(cv_df, "TransCompR_per_mouse.xlsx")
+
+# Make confusion matrix
+conf <- cv_df[,c("prediction", "real")]
+conf_mat_tab <- table(lapply(conf, factor))
+print(conf_mat_tab)
+
+# Create the new dataframe with the percentages
+
+result_df <- cv_df %>%
+  group_by(mouse, subset) %>%
+  mutate(
+    real_match = sum(prediction == real) / length(real) * 100,
+    shuff_match = sum(shuff == real) / length(real) * 100,
+    random_match = sum(random == real)/length(real) * 100,
+  ) %>%
+  tidyr::pivot_longer(cols = c(real_match, shuff_match, random_match),
+               names_to = "type",
+               values_to = "percentage")
+result_df <- as.data.frame(result_df)
+result_df <- result_df[,-which(colnames(result_df) %in% c("real", "shuff",
+                                                          "random", "prediction"))]
+result_df <- unique(result_df)
+result_df$type <- as.factor(result_df$type)
+
+# Plot the data
+result_df$type <- factor(result_df$type, levels = c("real_match",
+                                                    "random_match","shuff_match"))
+       
+plt <- ggplot(result_df, aes(x = type, y = percentage, fill = type, 
+                             group = type,  color = type)) +
+  geom_beeswarm(aes(group = type))+
+  stat_summary(fun = mean, geom = "crossbar", width = 0.2, size = 0.1,
+               color = "black") + 
+  stat_summary(fun.data = mean_sd, geom = "errorbar", width = 0.2) +
+  geom_signif(
+    comparisons = list(c("real_match", "random_match"),
+                       c("real_match", "shuff_match")),
+    test = "wilcox.test",
+    map_signif_level = F
+  ) +
+  scale_fill_manual(values = c("real_match" = "deeppink4", "shuff_match" = "darkgrey",
+                               "random_match" = "darkgrey"),
+                    labels = c("Real", "Shuffled", "Random Features")) +
+  scale_color_manual(values = c("real_match" = "deeppink4", "shuff_match" = "darkgrey",
+                                "random_match" = "darkgrey"),
+                    labels = c("Real", "Shuffled", "Random Features")) +
+  labs(y = "% Accuracy",
+       x = NULL) +
+  theme_classic() +
+  theme(legend.position = "none")
+
+# pdf("CV_per_mouse.pdf", width = 2.5, height = 3)
+# print(plt)
+# dev.off()
+
+#saveRDS(pred_list, "TransCompR_pt_rf_cv_perMouse.rds")
+
+####### accuracy of per cell predictions ###########################
+
+# saveRDS(pred_list_cell, "TransCompR_pt_rf_cv_perCell.rds")
+# pred_list_cell <- readRDS("/Users/christinedavis/Documents/GitHub/Rep1/Sassetti TB collaboration/Cross Validations/TransCompR_pt_rf_cv_perCell.rds")
+
+#plot CV values
+cv_df <- data.frame(mouse = unlist(pred_list_cell$mouse),
+                    round = unlist(pred_list_cell$round),
+                    prediction = unlist(pred_list_cell$prediction))
+
+#plot CV values
+cv_df_cell <- data.frame(mouse = unlist(pred_list_cell$mouse),
+                         cell = unlist(pred_list_cell$cell),
+                    round = unlist(pred_list_cell$round),
+                    prediction = unlist(pred_list_cell$prediction))
+
+cv_df$real <- rep(NA, nrow(cv_df))
+cv_df$real[which(grepl("B6", cv_df$mouse))] <- "Canonical"
+cv_df$real[which(grepl("CC024", cv_df$mouse))] <- "RSTR"
+cv_df$real[which(grepl("PWK", cv_df$mouse))] <- "RSTR"
+cv_df$real[which(grepl("CC011", cv_df$mouse))] <- "Canonical"
+
+cv_df_plt <- cv_df
+cv_df_plt$accurate <- rep(NA, nrow(cv_df_plt))
+cv_df_plt$accurate[which(cv_df_plt$prediction == cv_df_plt$real)] <- "T"
+cv_df_plt$accurate[which(cv_df_plt$prediction != cv_df_plt$real)] <- "F"
+
+#write.xlsx(cv_df_plt, "TransCompR_per_cell.xlsx")
+
+# Summarize data to get percentage of TRUE values and standard deviation
+summary_df <- cv_df_plt %>%
+  group_by(mouse, round) %>%
+  summarise(
+    count_T = sum(accurate == "T"),
+    count_F = sum(accurate == "F"),
+    total = n(),
+    percent_T = mean(accurate == "T") * 100,
+    sd_T = sd(accurate == "T") * 100
+  )
+
+summary_df$mouse <- as.factor(summary_df$mouse)
+
+# Create the stacked bar graph with error bars
+plt <- ggplot(summary_df, aes(x = mouse, y = percent_T,
+                              group = mouse)) +
+  geom_jitter(color = 'deeppink4', alpha = 0.7) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.2, size = 0.2,
+               color = "black") + 
+  stat_summary(fun.data = mean_sd, geom = "errorbar", width = 0.2) +
+  labs(x = NULL, y = "Accuracy (%)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 0.5, hjust=0.5))
+
+# pdf("CV_per_cell.pdf", width = 4, height = 3.07)
+# print(plt)
+# dev.off()
+
+table(cv_df_plt[,c("mouse","round")])
+
+```
+
+#What are the translatable PCs comprised of?
+```{r processing for STRING}
+#load string database
+string_db <- STRINGdb$new(version="12.0", 
+                           species=9606) #homo sapiens
+
+#map mPCs & hPCs to enriched string terms
+for (pc in unique(c(m_sig_coefs, h_sig_coefs))){
+  #top genes
+  #make variable
+  top <- paste0(pc, "_top")
+  top_enrichment <- paste0(pc, "_top_enrichment")
+  #get names of genes
+  assign(top, data.frame(gene = rownames(h_PC_loadings)[rev(order(as.matrix(h_PC_loadings[pc])))][1:167])) #top 20%
+  #get GO term enrichment of genes
+  assign(top_enrichment, string_db$get_enrichment(get(top)) %>%
+  dplyr::filter(grepl("GO", term)) %>%
+  dplyr::filter(!grepl("GOCC", term)) %>%
+    dplyr::filter(grepl("Process", category)) %>% #just take GO CC Process terms
+  dplyr::filter(!str_detect(description, "Dendritic|B cell|Mono|Leuko|leuko|Myeloid|fibroblas|mono|Mast|globulin")))
+  assign(top_enrichment, get(top_enrichment) %>%
+           mutate(ratio = number_of_genes/number_of_genes_in_background))
+  #bottom genes
+  bottom <- paste0(pc, "_bottom")
+  bottom_enrichment <- paste0(pc, "_bottom_enrichment")
+  #get names of genes
+  assign(bottom, data.frame(gene = rownames(h_PC_loadings)[order(as.matrix(h_PC_loadings[pc]))][1:167])) #bottom 20%
+  #get GO term enrichment of genes
+  assign(bottom_enrichment, string_db$get_enrichment(get(bottom)) %>%
+  dplyr::filter(grepl("GO", term)) %>%
+  dplyr::filter(!grepl("GOCC", term)) %>%
+    dplyr::filter(grepl("Process", category)) %>%
+  dplyr::filter(!str_detect(description, "Dendritic|B cell|Mono|Leuko|leuko|Myeloid|fibroblas|mono|Mast|globulin")))
+  assign(bottom_enrichment, get(bottom_enrichment) %>%
+           mutate(ratio = number_of_genes/number_of_genes_in_background))
+}
+
+```
+
+#Plot enrichment of translatable PCs
+```{r plotting enrichment}
+enrich_list <- c(paste0(m_sig_coefs, "_top_enrichment"), paste0(m_sig_coefs, "_bottom_enrichment"))
+for (enrich in enrich_list){
+  tmp <- get(enrich)
+  if (nrow(tmp) < 11){
+    plt <- ggplot(tmp, aes(x = ratio*100, y = fct_reorder(description, ratio), 
+                           fill = fdr, color = fdr)) +
+      geom_col() +
+      ggtitle(enrich) +
+      xlab("% of overall gene set occurring in top 20%") +
+      theme_classic()
+    pdf(paste0(enrich, "full.pdf"), width = 8, height = 5)
+    print(plt)
+    dev.off()
+  } else {
+  #filter for T cell specific terms, keywords based on looking at gene set names
+    tmp_t <- tmp %>% 
+      filter(grepl("T cell|T-helper|cytokine|interleukin|IL|lymphocyte|Lymphocyte|antigen|activation|differentiation",
+                   description))
+    
+    #plot!
+    plt1 <- ggplot(tmp_t, aes(x = ratio*100, y = fct_reorder(description, ratio), 
+                              fill = fdr, color = fdr)) +
+      geom_col() +
+      ggtitle(paste0(enrich, "_Tcell")) +
+      xlab("% of overall gene set occurring in top 20%") +
+      theme_classic()
+    
+    print(plt1)
+    
+    # pdf(paste0(enrich, "_Tcell.pdf"), width = 8, height = 5)
+    # print(plt1)
+    # dev.off()
+  }
+}
+
+```
+
+#Save enrichment of translatable PCs & human-only PCs
+```{r save STRING enrichment}
+# Create a new workbook
+wb <- createWorkbook()
+
+#list of enrichments to save
+enrich_list <- c(paste0(unique(c(m_sig_coefs, h_sig_coefs)), "_top_enrichment"), 
+                 paste0(unique(c(m_sig_coefs, h_sig_coefs)), "_bottom_enrichment"))
+
+# Loop through the list and add each data frame to a new sheet
+for (sheet_name in enrich_list) {
+  addWorksheet(wb, sheet_name)
+  writeData(wb, sheet_name, get(sheet_name))
+}
+
+# Save the workbook
+saveWorkbook(wb, "STRING_enrichment_significant_PCs.xlsx", overwrite = TRUE)
+```

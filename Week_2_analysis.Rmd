@@ -1,0 +1,278 @@
+---
+title: "Week 2 Gated Flow Data"
+author: "Christine Wiggins"
+date: "4/24/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+#rm(list = ls())
+knitr::opts_chunk$set(echo = TRUE)
+```
+Load packages
+```{r load}
+library(systemsseRology)
+#library(readxl)
+library(pheatmap)
+library(viridis)
+library(RColorBrewer)
+library(summarytools)
+library(ggpubr)
+#set.seed(1234)  # random seed for reproducibility
+# Create folder if it does not exist
+if (!(file.exists("Figures"))) {
+dir.create(file.path(getwd(), "Figures"))
+}
+```
+# Classification and preprocessing
+
+Read the data from an Excel file. Z-score the data and assign labels in the variables y1 and y2.
+
+Data include flow cytometry measurements for 52 mice across 2 phenotypes (NCan, Canonical)
+
+
+```{r data}
+#load and format data
+data <- as.data.frame(read.csv("Data/consolidated_2wk_master.csv"))
+data <- data[,-1]
+ID_wk2 <- data$uniqueID
+X <- suppressWarnings(as.matrix(as.data.frame(lapply(data[1:nrow(data), 8:ncol(data)], as.numeric))))
+X <- as.data.frame(X)
+rownames(X) <- data$uniqueID
+colnames(X) <- colnames(data)[8:ncol(data)]
+X$ID <- ID_wk2
+
+
+#Create set of outcomes to later regress on (lung and spleen CFU count)
+#gender <- factor(data[1:nrow(data),3])
+
+outcomenames <- c("Spleen_CFU","Lung_CFU_Log10","Percent_weight_change",
+                  "Weight_Start","Weight_2wk",
+                  "Total_IFNg_p300")
+outcomes <- X[, (colnames(X) %in% outcomenames)]
+
+#Load updated CFU, cytokine values from replated experiment
+data_cfu2 <- as.data.frame(read_excel("Data/2 week/Chal74 2wk data additions.xlsx"), header = T)
+
+lung_cyt2_raw <- as.data.frame(read_excel("Data/2 week/Chal74 2wk data additions.xlsx"), 
+                               header = T)[,1:19]
+
+#Take only outcomes of interest
+data_cfu2 <- data_cfu2[,c(1,3,4,20)]
+#Create vector of phenotype, 
+data_cfu2$Group[which(grepl("RSTR",data_cfu2$Group))] <- "R"
+data_cfu2$Group[which(grepl("Canonical",data_cfu2$Group))] <- "C"
+
+#Generate unique ID for each mouse
+data_cfu2$uniqueID <- paste0(data_cfu2$Genotype,"_",
+                               data_cfu2$Group, "_",
+                               data_cfu2$'Mouse ID')
+
+#Add outcomes back to flow cytometry data
+X <- merge(x=X,y=data_cfu2, by.x = "ID", by.y = "uniqueID")
+X <- X[, !(colnames(X) %in% outcomenames)]
+X[is.na(X)] <- 0
+
+#Create vector of mouse genotypes
+y1_wk2 <- X$Genotype
+y1_wk2 <- sub("_.*", "", y1_wk2)
+y1_wk2 <-factor(y1_wk2)
+y1_wk2 <- droplevels(y1_wk2)
+y1_wk2 <- as.factor(gsub("J","",y1_wk2))
+
+#Create vectors of phenotypes, CFU, and ID
+y2_wk2 <- factor(X$Group)
+cfu_wk2 <- X$Lung_CFU_Log10.y
+ID_wk2 <- X$ID
+
+#Remove metadata from flow cytometry data
+X <- X[,-which(grepl("Group|Lung_CFU_Log10|ID|Genotype|Weight|Total_Cells", colnames(X)))]
+df_wk2 <- as.data.frame(X)
+
+#remove the fully no cytokine information subset
+df_wk2 <- df_wk2[,-which(colSums(df_wk2) < .00001)]
+
+```
+
+#Z-scoring
+
+```{r Z-score}
+#Zscore data
+X <- as.data.frame(scale(df_wk2, center = TRUE, scale = TRUE))
+cfu <- as.matrix(scale(cfu_wk2, center = TRUE, scale = TRUE))
+rownames(X) <- rownames(df_wk2)
+
+#Repeat only for canonical
+X_canon <- as.data.frame(scale(df_wk2[which(y2_wk2 == "C"),], center = TRUE, scale = TRUE))
+cfu_canon <- as.matrix(scale(cfu_wk2[which(y2_wk2 == "C")], center = TRUE, scale = TRUE))
+rownames(X_canon) <- rownames(df_wk2[which(y2_wk2 == "C"),])
+
+#Repeat only for NCAN
+X_NCAN <- as.data.frame(scale(df_wk2[which(y2_wk2 == "R"),], center = TRUE, scale = TRUE))
+cfu_NCAN <- as.matrix(scale(cfu_wk2[which(y2_wk2 == "R")], center = TRUE, scale = TRUE))
+rownames(X_NCAN) <- rownames(df_wk2[which(y2_wk2 == "R"),])
+```
+
+The variable df_features contains information about the features, mainly used for visualization routines. 
+
+```{r annotation}
+library(tidyr)
+library(stringr)
+#Pull out identifying number from Excel sheet subject name
+identity <- rownames(X)
+
+#Create data frame with corresponding identity, strain, and resistor status
+df_id <- data.frame(identity = identity, strain = factor(y1_wk2), 
+                    status = factor(y2_wk2))
+print(df_id)
+
+df_features <- data.frame(name = colnames(X))
+df_features$label <- factor(df_features$name)
+print(df_features)
+```
+
+#PLSDA
+#Feature Selection Validation and Permutation testing
+
+```{r Select Features}
+library(ropls)
+library(systemsseRology)
+
+# general options for plotting
+my_colors <- list(
+  status = c("R" = '#8C02CC', "C" = '#5192C3', "equal" = 'black'), 
+  strain = c(viridis(9))
+  )
+names(my_colors$strain) <- c("CC009", "CC024","CC039", "PWK", "CC011", "CC059", "CC001",  "B6", "CC018")
+
+#select features with LASSO
+#Note: because LASSO involves partitioning the data, you can get slightly different
+#feature results on each run.
+opts_sel <- list(n_trials = 100, threshold = 0.8, return_count = TRUE)
+sel_features <- select_repeat(as.matrix(X), y2_wk2, 
+                              selector = select_lasso, 
+                              options = opts_sel)
+X_sel <- X[, sel_features$sel_features]
+
+# Perform a PLS-DA using the selected features and plot the scores and loadings
+# Check number of latent variables and increase to 2 if <2 (for visualization purposes)
+opts_plot <- list(df_id = df_id,
+                  loading_alpha = 1, # transparency for the loadings
+                  score_alpha = 1, # transparency for the scores
+                  LV_ind = c(1,2), # which LVs to plot
+                  color_features = "status", # according to which property the features should be color-coded
+                  colors = my_colors,
+                  y_name = "status") 
+
+opts_plot2 <- list(df_features = df_features,
+                  loading_alpha = 1, # transparency for the loadings
+                  score_alpha = 1, # transparency for the scores
+                  LV_ind = c(1,2), # which LVs to plot
+                  colors = my_colors,
+                  y_name = "status")
+
+opts_model <- list(n_LV = 2)
+
+#Use only the LASSO-selected features to build the model
+model <- train_ropls(X_sel, y2_wk2, options = opts_model)
+#print model summary- check R2X and R2Y to see that they're reasonable
+ropls::getSummaryDF(model)
+
+#Visualize the scores and loadings
+plt_scores <- visualize_ropls_scores(model, y2_wk2, options = opts_plot)
+print(plt_scores)
+
+plt_loadings <- visualize_ropls_loadings(model, options = opts_plot2)
+print(plt_loadings)
+
+# set additional options required to color code enrichment in the bar plot of the loadings
+opts_plot2$X <- X_sel
+opts_plot2$y <- y2_wk2
+opts_plot2$LV_ind <- 1
+opts_plot2$mark_enrichment <- TRUE
+plt_loadings_bar1 <- visualize_ropls_loadings_bar(model, options = opts_plot2)
+print(plt_loadings_bar1)
+opts_plot2$LV_ind <- 2
+plt_loadings_bar2 <- visualize_ropls_loadings_bar(model, options = opts_plot2)
+print(plt_loadings_bar2)
+
+```
+
+#Validation, Permutation Testing on Selected Features
+
+```{r Validation, Permutation of Selected Features}
+#How many rounds of feature selection do you want to run? What % of 
+#time should a feature be selected in order to be used (here is 80%)?
+opts_sel <- list(n_trials = 100, threshold = 0.8, return_count = FALSE)
+select <- function(X, y) { return(select_repeat(X, y, selector = select_lasso, options = opts_sel)) }
+
+#Input feature selection method, model training method, prediction method,
+#and how you want your results scores to be calculated
+method = list(select = select,
+              train = train_ropls,
+              predict = predict_ropls,
+              score = score_accuracy)
+
+#How many folds of cross-validation do you want, and how many random feature
+#and permuted lable trials?
+opts = list(n_folds = 5, pt_trials = 10, rf_trials = 10)
+return_vals2 <- cross_validation_unpaired(as.matrix(X), 
+                                          y2_wk2, method, opts, n_trials = 10)
+plt <- visualize_validate(return_vals2)
+u2 <- rowMeans(sapply(return_vals2, unlist))[1]
+u2
+u3 <- rowMeans(sapply(return_vals2,unlist))
+u3
+
+# pdf("../Sassetti TB collaboration/crossVal_2wk_canon_v_NCAN_new_gating.pdf", width = 8, height = 5) 
+# print(plt)
+# dev.off()
+
+#Pull 5-fold CV, random feature, and permuted labels scores together
+#you'll need to calculate p-value yourself & not rely on the automatic one in the plot
+validation_df <- data.frame(cv = unlist(return_vals2)[which(names(unlist(return_vals2)) == "cv_score")])
+null_df <- data.frame(rf = unlist(return_vals2)[which(grepl("rf_scores", names(unlist(return_vals2))))],
+                  pt = unlist(return_vals2)[which(grepl("pt_scores", names(unlist(return_vals2))))])
+
+#Save data
+# write.csv(validation_df, file = "../crossvalidation_2_wk_canon_v_NCAN_new_gating.csv")
+# write.csv(null_df, file = "../null_2_wk_canon_v_NCAN_new_gating.csv")
+
+```
+
+
+#Correlation Mapping
+
+```{r correlation heatmap}
+library(RColorBrewer)
+corrMat <- cor(X, method = "spearman")
+# heatmap for full correlation matrix
+pheatmap(-corrMat, cluster_rows = FALSE, cluster_cols = FALSE,        
+         color = colorRampPalette(brewer.pal(n = 10, name = "RdBu"))(100),
+         breaks = seq(1, -1, length = 100),
+         cellwidth = .5, cellheight = .5, fontsize = 6, border_color = "NA") 
+
+# keep only selected features and highly correlated features
+colMax <- function(X) apply(X, 2, max)
+corrMat <- corrMat[sel_features$sel_features, ]
+corrMat <- corrMat[, which(colMax(abs(corrMat)) < 1 & colMax(abs(corrMat)) > 0.7)]
+#recorder corrMat to group NCAN and canonical features together
+corrMat <- corrMat[c("Per_CD4_FOXP3p_Tbetn","CD4_CD39n_CD25p","Per_DC_CD11b",
+                     "CD4_CCR6p_CXCR3n","MCP1","Per_PMN_Nos2n_IL1bp",
+                     "CD4_CD44p_CD26Ln","IL7","Per_cd8_IL4_p300","Per_cd8_IL4_CFPMtb",
+                     "Per_DC_CD11b_PDL1n_CD14p",
+                     "nCD40LnCD107anIFNgnIL2nIL4nIL10nIL17.TNF",
+                     "CD4_FOXP3n_Tbetp_CXCR3p_RORgtn","DN_GATA3n_RORgtp",
+                     "CD40LnCD107anIFNgnIL2nIL4nIL10nIL17.TNF",
+                     "Per_Macrophage_PDL1n_CD14p"), ]
+
+# heatmap for reduced correlation matrix
+plt <-pheatmap(-corrMat, cluster_rows = FALSE, cluster_cols = TRUE,    
+         color = colorRampPalette(brewer.pal(n = 10, name = "RdBu"))(100),
+         breaks = seq(1, -1, length = 100),
+         treeheight_col = 0, treeheight_row = 0,
+         cellwidth = 6, cellheight = 8, fontsize = 8, border_color = "NA")
+# pdf("Figures/New gating figures/cocorrelate_network_2wk_new gating.pdf", width = 20, height = 8) 
+# print(plt)
+# dev.off()
+```

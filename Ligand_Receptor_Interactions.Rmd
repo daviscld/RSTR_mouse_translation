@@ -1,0 +1,212 @@
+---
+title: "Ligand Receptor Interactions"
+author: "Christine Wiggins"
+date: "1/31/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list = ls())
+```
+
+```{r}
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+ install.packages("BiocManager")
+}
+library(Seurat)
+#BiocManager::install("DT")
+library(DT)
+#library(liana)
+```
+
+#Import Seurat Objects
+#We're calling the NCan mice "RSTR" mice here to align easily with the human data,
+#but this labeling was changed in the paper figures
+```{r import data}
+
+#load object- will need to generate yourself
+immune.combined.Tcell <- readRDS("Data/immune_combined_Tcell_annotated.RDS")
+
+#split into RSTR and canonical
+immune.RSTR.Tcell <- subset(x = immune.combined.Tcell, subset = group == "RSTR")
+immune.canon.Tcell <- subset(x = immune.combined.Tcell, subset = group == "Canonical")
+
+saveRDS(immune.RSTR.Tcell, "immune.RSTR.Tcell.rds")
+saveRDS(immune.canon.Tcell, "immune.canon.Tcell.rds")
+
+immune.RSTR.Tcell <- readRDS("immune.RSTR.Tcell.rds")
+immune.canon.Tcell <- readRDS("immune.canon.Tcell.rds")
+
+remove(list = c("immune.combined.Tcell"))
+
+```
+
+#LIANA
+```{r LIANA}
+library(liana)
+
+# Here, we will convert LIANA's Consensus resource to murine symbols
+op_resource <- select_resource("Consensus")[[1]]
+
+# Generate orthologous resource
+ortholog_resource <- generate_homologs(op_resource = as.data.frame(op_resource),
+                                       target_organism = 10090) # mouse
+
+# Run LIANA with the orthologous resource
+
+liana_rstr <- liana_wrap(immune.RSTR.Tcell,
+                        resource = 'custom',
+                        external_resource = ortholog_resource,
+                        method = c("natmi", "connectome", "cellphonedb"),
+                        )
+
+#saveRDS(liana_rstr, "liana_rstr.rds")
+
+liana_canon <- liana_wrap(immune.canon.Tcell,
+                        resource = 'custom', 
+                        external_resource = ortholog_resource,
+                        method = c("natmi", "connectome", "logfc", "sca", "cellphonedb"),
+                        )
+#saveRDS(liana_canon, "liana_canon.rds")
+
+# aggregate
+liana_rstr <- liana_rstr %>%
+    liana_aggregate()
+saveRDS(liana_rstr, "liana_rstr.rds")
+liana_canon <- liana_canon %>%
+    liana_aggregate()
+saveRDS(liana_canon, "liana_canon.rds")
+
+#pull out IFNg
+liana_ifn_rstr <- liana_rstr[which(grepl("Ifn", liana_rstr$ligand.complex)),]
+liana_ifn_canon <- liana_canon[which(grepl("Ifn", liana_canon$ligand.complex)),]
+
+all_sources <- c(unique(liana_ifn_canon$source,
+                   liana_ifn_rstr$source))
+all_targets <- c(unique(liana_ifn_canon$target,
+                   liana_ifn_rstr$target))
+plt_ifn_rstr <- chord_freq(liana_ifn_rstr,
+                           source_groups = all_sources,
+                           target_groups = all_targets)
+plt_ifn_canon <- chord_freq(liana_ifn_canon,
+                           source_groups = all_sources,
+                           target_groups = all_targets)
+
+#pull out TNF
+liana_tnf_rstr <- liana_rstr[which(grepl("Tfn", liana_rstr$ligand.complex)),]
+liana_tnf_canon <- liana_canon[which(grepl("Tnf", liana_canon$ligand.complex)),]
+
+all_sources <- c(unique(liana_tnf_canon$source,
+                   liana_ifn_rstr$source))
+all_targets <- c(unique(liana_tnf_canon$target,
+                   liana_ifn_rstr$target))
+plt_tnf_rstr <- chord_freq(liana_tnf_rstr,
+                           source_groups = all_sources,
+                           target_groups = all_targets)
+plt_tnf_canon <- chord_freq(liana_tnf_canon,
+                           source_groups = all_sources,
+                           target_groups = all_targets)
+
+
+```
+
+#Plotting LIANA results
+```{r filter & plot}
+#save originals
+liana_rstr_full <- liana_rstr
+liana_canon_full <- liana_canon
+
+#filter liana results based on CellPhoneDB pvals for both specificity and magnitude
+liana_rstr <- liana_rstr_full %>%
+  dplyr::filter(specificity_rank < 0.05) %>%
+  dplyr::filter(magnitude_rank < 0.25)
+liana_canon <- liana_canon_full %>%
+  dplyr::filter(specificity_rank < 0.05) %>%
+  dplyr::filter(magnitude_rank < 0.25)
+
+liana_ifn_rstr <- liana_rstr[which(grepl("Ifng$", liana_rstr$ligand_complex)),]
+liana_ifn_canon <- liana_canon[which(grepl("Ifng$", liana_canon$ligand_complex)),]
+
+canon_sources <- unique(liana_ifn_canon$source)
+canon_targets <- unique(liana_ifn_canon$target)
+rstr_sources <- unique(liana_ifn_rstr$source)
+rstr_targets <- unique(liana_ifn_rstr$target)
+
+plt_ifn_rstr <- chord_freq(liana_ifn_rstr,
+                           source_groups = rstr_sources,
+                           target_groups = rstr_targets,
+                           cex = 0.5)
+plt_ifn_canon <- chord_freq(liana_ifn_canon,
+                           source_groups = canon_sources,
+                           target_groups = canon_targets,
+                           cex = 0.5)
+
+#TNF
+liana_tnf_rstr <- liana_rstr[which(grepl("Tnf$", liana_rstr$ligand_complex)),]
+liana_tnf_canon <- liana_canon[which(grepl("Tnf$", liana_canon$ligand_complex)),]
+
+canon_sources <- unique(liana_tnf_canon$source)
+canon_targets <- unique(liana_tnf_canon$target)
+rstr_sources <- unique(liana_tnf_rstr$source)
+rstr_targets <- unique(liana_tnf_rstr$target)
+
+plt_tnf_rstr <- chord_freq(liana_tnf_rstr,
+                           source_groups = rstr_sources,
+                           target_groups = rstr_targets,
+                           cex = 0.5)
+plt_tnf_canon <- chord_freq(liana_tnf_canon,
+                           source_groups = canon_sources,
+                           target_groups = canon_targets,
+                           cex = 0.5)
+
+
+#saveRDS(liana_res, "liana_res_combined.rds")
+```
+
+```{r all relationships ifng}
+#filter liana results based on CellPhoneDB pvals for specificity only
+liana_rstr <- liana_rstr_full %>%
+  dplyr::filter(specificity_rank < 0.05)
+liana_canon <- liana_canon_full %>%
+  dplyr::filter(specificity_rank < 0.05)
+
+liana_ifn_rstr_all <- liana_rstr[which(grepl("Ifng$", liana_rstr$ligand_complex)),]
+liana_ifn_canon_all <- liana_canon[which(grepl("Ifng$", liana_canon$ligand_complex)),]
+
+canon_sources <- unique(liana_ifn_canon$source)
+canon_targets <- unique(liana_ifn_canon$target)
+rstr_sources <- unique(liana_ifn_rstr$source)
+rstr_targets <- unique(liana_ifn_rstr$target)
+
+plt_ifn_rstr <- chord_freq(liana_ifn_rstr,
+                           source_groups = rstr_sources,
+                           target_groups = rstr_targets,
+                           cex = 0.5)
+plt_ifn_canon <- chord_freq(liana_ifn_canon,
+                           source_groups = canon_sources,
+                           target_groups = canon_targets,
+                           cex = 0.5)
+
+
+```
+
+#save data
+```{r save}
+library(openxlsx)
+all_data <- rbind(liana_ifn_canon, 
+                  liana_ifn_rstr, 
+                  liana_ifn_canon_all,
+                  liana_ifn_rstr_all)
+all_data$phenotype <- c(rep("canon", nrow(liana_ifn_canon)),
+                        rep("rstr", nrow(liana_ifn_rstr)),
+                        rep("canon", nrow(liana_ifn_canon_all)),
+                        rep("rstr", nrow(liana_ifn_rstr_all)))
+all_data$processing <- c(rep("specificity < 0.05, magnitude < 0.25", nrow(liana_ifn_canon)),
+                        rep("specificity < 0.05, magnitude < 0.25", nrow(liana_ifn_rstr)),
+                        rep("specificity < 0.05", nrow(liana_ifn_canon_all)),
+                        rep("specificity < 0.05", nrow(liana_ifn_rstr_all)))
+write.xlsx(all_data, "Data_for_Fig5.xlsx")
+
+```
+

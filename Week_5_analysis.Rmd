@@ -1,0 +1,1385 @@
+---
+title: "Week 5 Gated Flow Data"
+author: "Christine Wiggins"
+date: "4/24/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+rm(list = ls())
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load packages
+```{r load}
+library(systemsseRology)
+#library(readxl)
+library(pheatmap)
+library(viridis)
+library(RColorBrewer)
+library(summarytools)
+library(ggpubr)
+library(tidyverse)
+library(corrr)
+library(igraph)
+library(ggraph)
+library(ggrepel)
+library(wesanderson)
+library(corrr)
+library(igraph)
+
+# Create folder if it does not exist
+if (!(file.exists("Figures"))) {
+dir.create(file.path(getwd(), "Figures"))
+}
+```
+
+# Classification and preprocessing
+
+Read the data from an Excel file. Z-score the data and assign labels in the variables y1 and y2.
+
+```{r data}
+#load and format data
+data <- as.data.frame(read.csv("Data/consolidated_5wk_master.csv"))
+data <- data[,-1]
+colnames(data) <- gsub("CD4107a","CD107a",colnames(data))
+ID_wk5 <- data$uniqueID
+X <- as.data.frame(suppressWarnings(as.matrix(as.data.frame(lapply(data[1:nrow(data), 8:ncol(data)], as.numeric)))))
+rownames(X) <- data$uniqueID
+colnames(X) <- colnames(data)[8:ncol(data)]
+X$ID <- ID_wk5
+
+#Create vector of resistor status, create set of outcomes to later regress on (lung and spleen CFU count, % weight loss)
+sex <- factor(data[1:nrow(data),3])
+
+outcomenames <- c("Spleen_CFU","Lung_CFU_Log10","Percent_weight_change",
+                  "Weight_Start",
+                  "Weight_5wk", "Total_IFNg_p300",
+                  "Per_Total_IFNg_p300","Lung_CFU")
+outcomes <- X[, (colnames(X) %in% outcomenames)]
+outcomes$uniqueID <- X$ID
+
+#Discard metadata from measurement df
+X <- X[, !(colnames(X) %in% outcomenames)]
+X[is.na(X)] <- 0
+
+#Create record of mouse strains
+y1_wk5 <- data$Genotype
+y1_wk5 <- sub("_.*|J", "", y1_wk5)
+y1_wk5 <- droplevels(factor(y1_wk5))
+
+#Create record of phenotype & CFU
+y2_wk5 <- factor(data$Group)
+cfu_wk5 <- outcomes$Lung_CFU
+ID_wk5 <- X$ID
+
+#Discard more metadata from measurement df
+X <- X[,-which(grepl("Group|Lung_CFU_Log10|ID|Genotype", colnames(X)))]
+df_wk5 <- as.data.frame(X)
+
+#remove the fully no cytokine information subset
+df_wk5 <- df_wk5[,-which(colSums(df_wk5) < .00001)]
+
+```
+
+#Z-scoring
+```{r Z-score}
+X <- as.data.frame(scale(df_wk5, center = TRUE, scale = TRUE))
+cfu <- as.matrix(scale(cfu_wk5, center = TRUE, scale = TRUE))
+rownames(X) <- rownames(df_wk5)
+
+#Repeat only for canonical
+X_canon <- as.data.frame(scale(df_wk5[which(y2_wk5 == "C"),], 
+                               center = TRUE, scale = TRUE))
+cfu_canon <- as.matrix(scale(cfu_wk5[which(y2_wk5 == "C")], center = TRUE, scale = TRUE))
+rownames(X_canon) <- rownames(df_wk5[which(y2_wk5 == "C"),])
+
+#Repeat only for NCAN
+X_NCAN <- as.data.frame(scale(df_wk5[which(y2_wk5 == "R"),], 
+                              center = TRUE, scale = TRUE))
+cfu_NCAN <- as.matrix(scale(cfu_wk5[which(y2_wk5 == "R")], center = TRUE, scale = TRUE))
+rownames(X_NCAN) <- rownames(df_wk5[which(y2_wk5 == "R"),])
+```
+
+The variable df_features contains information about the features, mainly used for visualization routines. 
+
+```{r annotation}
+library(tidyr)
+library(stringr)
+#Pull out identifying number from Excel sheet subject name
+identity <- rownames(X)
+
+#Create data frame with corresponding identity, strain, and resistor status
+df_id <- data.frame(identity = identity, strain = factor(y1_wk5), 
+                    status = factor(y2_wk5))
+print(df_id)
+
+df_features <- data.frame(name = colnames(X))
+df_features$label <- factor(df_features$name)
+print(df_features)
+```
+
+#LASSO PLSDA
+```{r PLSDA}
+library(ropls)
+library(systemsseRology)
+
+my_colors <- list(
+  status = c("R" = '#8C02CC', "C" = '#5192C3', "equal" = 'black'), 
+  strain = c(viridis(9))
+  )
+names(my_colors$strain) <- c("CC009", "CC024","CC039", "PWK", "CC011", "CC059", "CC001",  "B6", "CC018")
+
+#Set options for how PLSDA will be implemented
+opts_sel <- list(n_trials = 100, threshold = 0.8, return_count = TRUE)
+#run LASSO to select features
+sel_features <- select_repeat(as.matrix(X), y2_wk5, 
+                              selector = select_lasso, 
+                              options = opts_sel)
+X_sel <- X[, sel_features$sel_features]
+
+# Perform a PLS-DA using the selected features and plot the scores and loadings
+# Check number of latent variables and increase to 2 if <2 (for visualization purposes)
+opts_plot <- list(df_id = df_id,
+                  loading_alpha = 1, # transparency for the loadings
+                  score_alpha = 1, # transparency for the scores
+                  LV_ind = c(1,2), # which LVs to plot
+                  color_features = "status", # according to which property the features should be color-coded
+                  colors = my_colors,
+                  y_name = "status") 
+
+opts_plot2 <- list(df_features = df_features,
+                  loading_alpha = 1, # transparency for the loadings
+                  score_alpha = 1, # transparency for the scores
+                  LV_ind = c(1,2), # which LVs to plot
+                  colors = my_colors,
+                  y_name = "status")
+#Build PLSDA model with selected features
+opts_model <- list(n_LV = 2)
+model_pca <- pca_ropls(X_sel)
+ropls::getSummaryDF(model_pca)
+model <- train_ropls(X_sel, y2_wk5, options = opts_model)
+ropls::getSummaryDF(model)
+plt_scores <- visualize_ropls_scores(model, y2_wk5, options = opts_plot)
+print(plt_scores)
+
+plt_loadings <- visualize_ropls_loadings(model, options = opts_plot2)
+print(plt_loadings)
+
+# set additional options required to color code enrichment in the bar plot of the loadings
+opts_plot2$X <- X_sel
+opts_plot2$y <- y2_wk5
+opts_plot2$LV_ind <- 1
+opts_plot2$mark_enrichment <- TRUE
+plt_loadings_bar1 <- visualize_ropls_loadings_bar(model, options = opts_plot2)
+print(plt_loadings_bar1)
+opts_plot2$LV_ind <- 2
+plt_loadings_bar2 <- visualize_ropls_loadings_bar(model, options = opts_plot2)
+print(plt_loadings_bar2)
+
+#save scores and loadings
+# library(openxlsx)
+# tmp <- as.data.frame(getScoreMN(model))
+# tmp$mouse <- rownames(tmp)
+# write.xlsx(tmp, "PLSDA_scores_5wk.xlsx")
+# tmp <- as.data.frame(getLoadingMN(model))
+# tmp$feature <- rownames(tmp)
+# write.xlsx(tmp, "PLSDA_loadings_5wk.xlsx")
+
+```
+
+#Validation, Permutation Testing on Selected Features
+```{r Validation, Permutation of Selected Features}
+#Set LASSO parameters for cross validation
+opts_sel <- list(n_trials = 100, threshold = 0.8, return_count = FALSE)
+select <- function(X, y) { return(select_repeat(X, y, selector = select_lasso, options = opts_sel)) }
+#set cross validation methods, including score type, model type, etc.
+method = list(select = select,
+              train = train_ropls,
+              predict = predict_ropls,
+              score = score_accuracy)
+#set cross-validation parameters for folds, number of trials of each CV type
+opts = list(n_folds = 5, pt_trials = 10, rf_trials = 10)
+
+#return selected scores for each trial & fold
+return_vals2 <- cross_validation_unpaired(as.matrix(X), y2_wk5, method, opts, n_trials = 10)
+
+#visualization
+plt <- visualize_validate(return_vals2)
+u2 <- rowMeans(sapply(return_vals2, unlist))[1]
+u2
+u3 <- rowMeans(sapply(return_vals2,unlist))
+u3
+
+# pdf("crossVal_5wk_CvR_new_gating.pdf", width = 8, height = 5) 
+# print(plt)
+# dev.off()
+
+#you'll need to calculate p-value yourself & not rely on the automatic one in the plot
+validation_df <- data.frame(cv = unlist(return_vals2)[which(names(unlist(return_vals2)) == "cv_score")])
+null_df <- data.frame(rf = unlist(return_vals2)[which(grepl("rf_scores",
+                names(unlist(return_vals2))))],
+             pt = unlist(return_vals2)[which(grepl("pt_scores",
+                 names(unlist(return_vals2))))])
+# write.csv(validation_df, 
+#           file = "crossvalidation_5_wk_canon_v_NCAN_new_gating.csv")
+# write.csv(null_df, 
+#           file = "null_5_wk_canon_v_NCAN_new_gating.csv")
+
+#You can load your validation df from csv if you have previously saved it
+#validation_df <- read.csv("crossvalidation_5_wk_canon_v_NCAN_new_gating.csv")
+#null_df <- read.csv("null_5_wk_canon_v_NCAN_new_gating.csv")
+
+val_df_melt <- reshape2::melt(validation_df)
+null_df_melt <- reshape2::melt(null_df)
+
+plt_df <- rbind(val_df_melt, null_df_melt)
+
+#If you load your validation df from a csv, you need to remove a column
+#that contains the rownames/numbers, so uncomment below
+#plt_df <- plt_df[-which(plt_df$variable == "X"),]
+
+plt <- ggplot(plt_df[which(plt_df$variable %in% c("cv", "rf")),],
+              aes(x = variable, y = value,
+                          group = variable)) +
+  geom_jitter(width = 0.15, size = 2) +
+  stat_compare_means() +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.2, size = 0.1,
+               color = "black") + 
+  stat_summary(fun.data = mean_sd, geom = "errorbar", width = 0.2) +
+  ylab("Model accuracy") +
+  xlab("") +
+  theme_classic()
+
+# pdf("plsda_5wk_cv.pdf", width = 2, height = 2)
+# print(plt)
+# dev.off
+# 
+# #save data
+# write.xlsx(plt_df[which(plt_df$variable %in% c("cv", "rf")),],
+#            "plsa_5wk_cv.xlsx")
+
+
+```
+
+#Define function
+```{r feature_pca function}
+#' Create feature PCAs and pull out loadings
+#' This separates out your dataframe by each relevant cell type and transforms
+#' the data into principal components. These principal components are then 
+#' used to try to create two groups in PC space. These two groups are compared
+#' via Adjusted Rand Index to NCan and Canonical labels to see which
+#' cell type's variance is most discriminatory between NCan and Can phenotypes.
+
+#' @param X dataframe of scaled features
+#' @param status string of desired comparison group
+#' @param outcomes matrix of outcome measurements
+#'
+#' @return
+#' @export
+#'
+create_feature_pcas <- function(X, outcomes){
+
+
+  outcomes_feature <- outcomes
+
+  #NK
+  NK_ft <- X[,which(grepl("NK",colnames(X)))]
+  model_pca_NK <- pca_ropls(NK_ft)
+  NK_pca_df <- getScoreMN(model_pca_NK)
+  NK_loadings <- getLoadingMN(model_pca_NK)
+  rownames(NK_pca_df) <- outcomes_feature
+  colnames(NK_pca_df) <- paste0(paste0("LV", as.character(seq(1:ncol(NK_pca_df)), sep="")),"NK", sep="_")
+  print("NK")
+
+  #CD4
+  CD4_ft <- as.matrix(X[,which(grepl("CD4_",colnames(X)))])
+  model_pca_CD4 <- pca_ropls(CD4_ft)
+  CD4_pca_df <- getScoreMN(model_pca_CD4)
+  CD4_loadings <- getLoadingMN(model_pca_CD4)
+  rownames(CD4_pca_df) <- outcomes_feature
+  colnames(CD4_pca_df) <- paste0(paste0("LV", as.character(seq(1:ncol(CD4_pca_df)), sep="")),"CD4",sep="_")
+  print("CD4")
+
+  #DN
+  DN_ft <- as.matrix(X[,which(grepl("DN_",colnames(X)))])
+  model_pca_DN <- pca_ropls(DN_ft)
+  DN_pca_df <- getScoreMN(model_pca_DN)
+  DN_loadings <- getLoadingMN(model_pca_DN)
+  rownames(DN_pca_df) <- outcomes_feature
+  colnames(DN_pca_df) <- paste0(paste0("LV", as.character(seq(1:ncol(DN_pca_df)), sep="")),"DN",sep="_")
+  print("DN")
+
+  #CD8
+  CD8_ft <- X[,which(grepl("CD8_",colnames(X)))]
+  model_pca_CD8 <- pca_ropls(CD8_ft)
+  CD8_pca_df <- getScoreMN(model_pca_CD8)
+  CD8_loadings <- getLoadingMN(model_pca_CD8)
+  rownames(CD8_pca_df) <- outcomes_feature
+  colnames(CD8_pca_df) <- paste0(paste0("LV", as.character(seq(1:ncol(CD8_pca_df)), sep="")),"CD8",sep="_")
+  print("CD8")
+
+  #gdTCR
+  gdTCR_ft <- X[,which(grepl("gdTCR",colnames(X)))]
+  model_pca_gdTCR <- pca_ropls(gdTCR_ft)
+  gdTCR_pca_df <- getScoreMN(model_pca_gdTCR)
+  gdTCR_loadings <- getLoadingMN(model_pca_gdTCR)
+  rownames(gdTCR_pca_df) <- outcomes_feature
+  colnames(gdTCR_pca_df) <- paste0(paste0("LV", as.character(seq(1:ncol(gdTCR_pca_df)), sep="")),"gdTCR",sep="_")
+  print("gdTCR")
+
+  #CD19
+  CD19_ft <- X[,which(grepl("CD19",colnames(X)))]
+  model_pca_CD19 <- pca_ropls(CD19_ft)
+  CD19_pca_df <- getScoreMN(model_pca_CD19)
+  CD19_loadings <- getLoadingMN(model_pca_CD19)
+  rownames(CD19_pca_df) <- outcomes_feature
+  colnames(CD19_pca_df) <- paste0(paste0("LV", as.character(seq(1:ncol(CD19_pca_df)), sep="")),"CD19",sep="_")
+  print("CD19")
+
+  #Eosinophil
+  Eos_ft <- X[,which(grepl("Eos|eos",colnames(X)))]
+  model_pca_Eos <- pca_ropls(Eos_ft)
+  Eos_pca_df <- getScoreMN(model_pca_Eos)
+  Eos_loadings <- getLoadingMN(model_pca_Eos)
+  rownames(Eos_pca_df) <- outcomes_feature
+  colnames(Eos_pca_df) <- paste0(paste0("LV", as.character(seq(1:ncol(Eos_pca_df)), sep="")),"Eos", sep="_")
+  print("Eos")
+
+  #PMN (neutrophil)
+  PMN_ft <- X[,which(grepl("PMN",colnames(X)))]
+  model_pca_PMN <- pca_ropls(PMN_ft)
+  PMN_pca_df <- getScoreMN(model_pca_PMN)
+  PMN_loadings <- getLoadingMN(model_pca_PMN)
+  rownames(PMN_pca_df) <- outcomes_feature
+  colnames(PMN_pca_df) <- paste0(paste0("LV", as.character(seq(1:ncol(PMN_pca_df)), sep="")),"Eos", sep="_")
+  print("PMN")
+
+  #IFNg (cytokines pull measurements from all cell types)
+  IFNg_ft <- X[,which(grepl("IFN",colnames(X)))]
+  model_pca_IFNg <- pca_ropls(IFNg_ft)
+  IFNg_pca_df <- getScoreMN(model_pca_IFNg)
+  IFNg_loadings <- getLoadingMN(model_pca_IFNg)
+  rownames(IFNg_pca_df) <- outcomes_feature
+  colnames(IFNg_pca_df) <- paste0(paste0("LV", as.character(seq(1:ncol(IFNg_pca_df)), sep="")),"IFNg",sep="_")
+  print("IFNg")
+
+  #IL17
+  IL17_ft <- X[,which(grepl("IL17_|_IL17",colnames(X)))]
+  model_pca_IL17 <- pca_ropls(IL17_ft)
+  IL17_pca_df <- getScoreMN(model_pca_IL17)
+  IL17_loadings <- getLoadingMN(model_pca_IL17)
+  rownames(IL17_pca_df) <- outcomes_feature
+  colnames(IL17_pca_df) <- paste0(paste0("LV", as.character(seq(1:ncol(IL17_pca_df)), sep="")),"IL17",sep="_")
+  print("IL17")
+
+  #IL4
+  IL4_ft <- X[,which(grepl("IL4_|_IL4",colnames(X)))]
+  model_pca_IL4 <- pca_ropls(IL4_ft)
+  IL4_pca_df <- getScoreMN(model_pca_IL4)
+  IL4_loadings <- getLoadingMN(model_pca_IL4)
+  rownames(IL4_pca_df) <- outcomes_feature
+  colnames(IL4_pca_df) <- paste0(paste0("LV", as.character(seq(1:ncol(IL4_pca_df)), sep="")),"IL4",sep="_")
+  print("IL4")
+
+  #IL2
+  IL2_ft <- X[,which(grepl("IL2_|_IL2",colnames(X)))]
+  model_pca_IL2 <- pca_ropls(IL2_ft)
+  IL2_pca_df <- getScoreMN(model_pca_IL2)
+  IL2_loadings <- getLoadingMN(model_pca_IL2)
+  rownames(IL2_pca_df) <- outcomes_feature
+  colnames(IL2_pca_df) <- paste0(paste0("LV", as.character(seq(1:ncol(IL2_pca_df)), sep="")),"IL2",sep="_")
+  print("IL2")
+
+  #CD40
+  CD40_ft <- X[,which(grepl("CD40",colnames(X)))]
+  model_pca_CD40 <- pca_ropls(CD40_ft)
+  CD40_pca_df <- getScoreMN(model_pca_CD40)
+  CD40_loadings <- getLoadingMN(model_pca_CD40)
+  rownames(CD40_pca_df) <- outcomes_feature
+  colnames(CD40_pca_df) <- paste0(paste0("LV", as.character(seq(1:ncol(CD40_pca_df)), sep="")),"CD40",sep="_")
+  print("CD40")
+
+  #CD86
+  CD86_ft <- X[,which(grepl("CD86",colnames(X)))]
+  model_pca_CD86 <- pca_ropls(CD86_ft)
+  CD86_pca_df <- getScoreMN(model_pca_CD86)
+  CD86_loadings <- getLoadingMN(model_pca_CD86)
+  rownames(CD86_pca_df) <- outcomes_feature
+  colnames(CD86_pca_df) <- paste0(paste0("LV", as.character(seq(1:ncol(CD86_pca_df)), sep="")),"Eos", sep="_")
+  print("CD86")
+
+  #TNF
+  TNF_ft <- X[,which(grepl("TNF",colnames(X)))]
+  model_pca_TNF <- pca_ropls(TNF_ft)
+  TNF_pca_df <- getScoreMN(model_pca_TNF)
+  TNF_loadings <- getLoadingMN(model_pca_TNF)
+  rownames(TNF_pca_df) <- outcomes_feature
+  colnames(TNF_pca_df) <- paste0(paste0("LV", as.character(seq(1:ncol(TNF_pca_df)), sep="")),"TNF",sep="_")
+  print("TNF")
+
+  #CD107a
+  CD107a_ft <- X[,which(grepl("CD107a",colnames(X)))]
+  model_pca_CD107a <- pca_ropls(CD107a_ft)
+  CD107a_pca_df <- getScoreMN(model_pca_CD107a)
+  CD107a_loadings <- getLoadingMN(model_pca_CD107a)
+  rownames(CD107a_pca_df) <- outcomes_feature
+  colnames(CD107a_pca_df) <- paste0(paste0("LV", as.character(seq(1:ncol(CD107a_pca_df)), sep="")),"CD107a",sep="_")
+  print("CD107a")
+
+  #Nos2
+  nos2_ft <- X[,which(grepl("Nos2",colnames(X)))]
+  model_pca_nos2 <- pca_ropls(nos2_ft)
+  nos2_pca_df <- getScoreMN(model_pca_nos2)
+  nos2_loadings <- getLoadingMN(model_pca_nos2)
+  rownames(nos2_pca_df) <- outcomes_feature
+  colnames(nos2_pca_df) <- paste0(paste0("LV", as.character(seq(1:ncol(nos2_pca_df)), sep="")),"Nos2",sep="_")
+  print("Nos2")
+
+  #PDL1
+  pdl1_ft <- X[,which(grepl("PDL1|Pdl1|PdL1",colnames(X)))]
+  model_pca_pdl1 <- pca_ropls(pdl1_ft)
+  pdl1_pca_df <- getScoreMN(model_pca_pdl1)
+  pdl1_loadings <- getLoadingMN(model_pca_pdl1)
+  rownames(pdl1_pca_df) <- outcomes_feature
+  colnames(pdl1_pca_df) <- paste0(paste0("LV", as.character(seq(1:ncol(pdl1_pca_df)), sep="")),"PDL1",sep="_")
+  print("pdl1")
+
+  #CD103DC
+  CD103_ft <- X[,which(grepl("CD103",colnames(X)))]
+  #CD103_ft <- CD103_ft[,-which(grepl("DC_IL6",colnames(CD103_ft)))]
+  model_pca_CD103 <- pca_ropls(CD103_ft)
+  CD103_pca_df <- getScoreMN(model_pca_CD103)
+  CD103_loadings <- getLoadingMN(model_pca_CD103)
+  rownames(CD103_pca_df) <- outcomes_feature
+  colnames(CD103_pca_df) <- paste0(paste0("LV", as.character(seq(1:ncol(CD103_pca_df)), sep="")),"CD103DC",sep="_")
+  print("CD103DC")
+
+  #CD11bDC
+  CD11b_ft <- X[,which(grepl("DC_CD11b",colnames(X)))]
+  model_pca_CD11b <- pca_ropls(CD11b_ft)
+  CD11b_pca_df <- getScoreMN(model_pca_CD11b)
+  CD11b_loadings <- getLoadingMN(model_pca_CD11b)
+  rownames(CD11b_pca_df) <- outcomes_feature
+  colnames(CD11b_pca_df) <- paste0(paste0("LV", as.character(seq(1:ncol(CD11b_pca_df)), sep="")),"CD11bDC",sep="_")
+  print("CD11bDC")
+
+  #IL10
+  IL10_ft <- X[,which(grepl("IL10",colnames(X)))]
+  #IL10_ft <- IL6_ft[,-which(grepl("DC_IL6",colnames(IL6_ft)))]
+  model_pca_IL10 <- pca_ropls(IL10_ft)
+  IL10_pca_df <- getScoreMN(model_pca_IL10)
+  IL10_loadings <- getLoadingMN(model_pca_IL10)
+  rownames(IL10_pca_df) <- outcomes_feature
+  colnames(IL10_pca_df) <- paste0(paste0("LV", as.character(seq(1:ncol(IL10_pca_df)), sep="")),"IL10",sep="_")
+  print("IL10")
+
+  #IL1b
+  IL1b_ft <- X[,which(grepl("IL1b",colnames(X)))]
+  model_pca_IL1b <- pca_ropls(IL1b_ft)
+  IL1b_pca_df <- getScoreMN(model_pca_IL1b)
+  IL1b_loadings <- getLoadingMN(model_pca_IL1b)
+  rownames(IL1b_pca_df) <- outcomes_feature
+  colnames(IL1b_pca_df) <- paste0(paste0("LV", as.character(seq(1:ncol(IL1b_pca_df)), sep="")),"IL1b",sep="_")
+  print("IL1b")
+
+  #other
+  otherL_ft <- X[,which(grepl("Other",colnames(X)))]
+  model_pca_otherL <- pca_ropls(otherL_ft)
+  otherL_pca_df <- getScoreMN(model_pca_otherL)
+  otherL_loadings <- getLoadingMN(model_pca_otherL)
+  rownames(otherL_pca_df) <- outcomes_feature
+  colnames(otherL_pca_df) <- paste0(paste0("LV", as.character(seq(1:ncol(otherL_pca_df)), sep="")),"otherL",sep="_")
+  print("otherL")
+
+  #Alveolar macrophages
+  AMac_ft <- X[,which(grepl("AMac|Alveolar",colnames(X)))]
+  model_pca_AMac <- pca_ropls(AMac_ft)
+  AMac_pca_df <- getScoreMN(model_pca_AMac)
+  AMac_loadings <- getLoadingMN(model_pca_AMac)
+  rownames(AMac_pca_df) <- outcomes_feature
+  colnames(AMac_pca_df) <- paste0(paste0("LV", as.character(seq(1:ncol(AMac_pca_df)), sep="")),"AMac",sep="_")
+  print("AMac")
+
+  #Macrophage
+  mac_ft <- X[,which(grepl("^Mac|^mac|_mac|_Mac",colnames(X)))]
+  model_pca_mac <- pca_ropls(mac_ft)
+  mac_pca_df <- getScoreMN(model_pca_mac)
+  mac_loadings <- getLoadingMN(model_pca_mac)
+  rownames(mac_pca_df) <- outcomes_feature
+  colnames(mac_pca_df) <- paste0(paste0("LV", as.character(seq(1:ncol(mac_pca_df)), sep="")),"Mac",sep="_")
+  print("mac")
+
+  #Monocytes
+  mono_ft <- X[,which(grepl("mono|Mono",colnames(X)))]
+  model_pca_mono <- pca_ropls(mono_ft)
+  mono_pca_df <- getScoreMN(model_pca_mono)
+  mono_loadings <- getLoadingMN(model_pca_mono)
+  rownames(mono_pca_df) <- outcomes_feature
+  colnames(mono_pca_df) <- paste0(paste0("LV", as.character(seq(1:ncol(mono_pca_df)), sep="")),"Mono",sep="_")
+  print("mono")
+
+  #Create df of all PC scores
+  grp1_pca_df <- cbind(NK_pca_df,CD4_pca_df,CD8_pca_df, DN_pca_df,
+                       gdTCR_pca_df,CD19_pca_df,IFNg_pca_df,IL17_pca_df,
+                       IL4_pca_df,IL2_pca_df,CD40_pca_df,TNF_pca_df,
+                       CD107a_pca_df,nos2_pca_df,pdl1_pca_df,CD103_pca_df,
+                       CD11b_pca_df,IL10_pca_df,IL1b_pca_df,otherL_pca_df,
+                       AMac_pca_df,mac_pca_df,mono_pca_df, CD86_pca_df,
+                       Eos_pca_df, PMN_pca_df)
+
+  out <- list()
+  out$NK_loadings <- NK_loadings
+  out$CD4_loadings <- CD4_loadings
+  out$CD8_loadings <- CD8_loadings
+  out$DN_loadings <- DN_loadings
+  out$gdTCR_loadings <- gdTCR_loadings
+  out$CD19_loadings <- CD19_loadings
+  out$Eos_loadings <- Eos_loadings
+  out$PMN_loadings <- PMN_loadings
+  out$IFNg_loadings <- IFNg_loadings
+  out$IL17_loadings <- IL17_loadings
+  out$IL4_loadings <- IL4_loadings
+  out$IL2_loadings <- IL2_loadings
+  out$CD40_loadings <- CD40_loadings
+  out$CD86_loadings <- CD86_loadings
+  out$TNF_loadings <- TNF_loadings
+  out$CD107a_loadings <- CD107a_loadings
+  out$nos2_loadings <- nos2_loadings
+  out$pdl1_loadings <- pdl1_loadings
+  out$CD103_loadings <- CD103_loadings
+  out$CD11b_loadings <- CD11b_loadings
+  out$IL10_loadings <- IL10_loadings
+  out$IL1b_loadings <- IL1b_loadings
+  out$otherL_loadings <- otherL_loadings
+  out$AMac_loadings <- AMac_loadings
+  out$mac_loadings <- mac_loadings
+  out$mono_loadings <- mono_loadings
+
+  out$NK_pca_df <- NK_pca_df
+  out$CD8_pca_df <- CD8_pca_df
+  out$CD4_pca_df <- CD4_pca_df
+  out$DN_pca_df <- DN_pca_df
+  out$gdTCR_pca_df <- gdTCR_pca_df
+  out$CD19_pca_df <- CD19_pca_df
+  out$Eos_pca_df <- Eos_pca_df
+  out$PMN_pca_df <- PMN_pca_df
+  out$IFNg_pca_df <- IFNg_pca_df
+  out$IL17_pca_df <- IL17_pca_df
+  out$IL4_pca_df <- IL4_pca_df
+  out$IL2_pca_df <- IL2_pca_df
+  out$CD40_pca_df <- CD40_pca_df
+  out$CD86_pca_df <- CD86_pca_df
+  out$TNF_pca_df <- TNF_pca_df
+  out$CD107a_pca_df <- CD107a_pca_df
+  out$nos2_pca_df <- nos2_pca_df
+  out$pdl1_pca_df <- pdl1_pca_df
+  out$CD103_pca_df <- CD103_pca_df
+  out$CD11b_pca_df <- CD11b_pca_df
+  out$IL10_pca_df <- IL10_pca_df
+  out$IL1b_pca_df <- IL1b_pca_df
+  out$otherL_pca_df <- otherL_pca_df
+  out$AMac_pca_df <- AMac_pca_df
+  out$Mac_pca_df <- mac_pca_df
+  out$mono_pca_df <- mono_pca_df
+
+  out$grp1_pca_df <- grp1_pca_df
+
+  return(out)
+}
+
+```
+
+#Blocked PCA - single feature Rand
+#PCA on features
+```{r group PCA}
+library(mclust)
+library(ropls)
+library(reshape2)
+library(data.table)
+library(systemsseRology)
+library(ClusterR)
+
+week5_pca <- create_feature_pcas(X, y2_wk5)
+
+ft_set <- c("NK_pca_df", "CD4_pca_df", "CD8_pca_df", "DN_pca_df", 
+            "gdTCR_pca_df", "CD19_pca_df", "Eos_pca_df",
+            "PMN_pca_df", "IFNg_pca_df", "IL17_pca_df", "IL4_pca_df", 
+            "IL2_pca_df", "CD40_pca_df",
+            "CD86_pca_df", "TNF_pca_df", "CD107a_pca_df", "nos2_pca_df", 
+            "pdl1_pca_df",  "CD103_pca_df", "CD11b_pca_df", 
+            "IL10_pca_df", "IL1b_pca_df", "otherL_pca_df",
+            "AMac_pca_df", "Mac_pca_df", "mono_pca_df")
+
+rand_record <- list()
+rand_names <- list()
+i <- 0
+
+for (feat1 in ft_set){
+  feat1_name <- strsplit(feat1, "_")[[1]][1]
+  feat1_df <- week5_pca[[feat1]]
+    i <- i + 1
+    
+      #How good is each sub-space at clustering NCAN or canonical mice together?
+      #clust <- kmeans(full_scores, 2, iter.max = 100, nstart = 100) #kmeans
+      clust <- GMM(feat1_df, 2, dist_mode = "eucl_dist", 
+                   seed_mode = "random_subset", km_iter = 100,
+          em_iter = 100, verbose = F)    
+      cluster_num <- rep(NA,nrow(feat1_df))
+      for (ind in 1:nrow(clust$Log_likelihood)){
+          if (clust$Log_likelihood[ind,1] > clust$Log_likelihood[ind,2]){
+              cluster_num[ind] <- 1
+          } else {
+              cluster_num[ind] <- 2
+          }
+      }
+      rand <- adjustedRandIndex(cluster_num, y2_wk5)
+      
+      rand_record[i] <- rand
+      feature_name <- feat1_name
+      rand_names[i] <- feature_name
+      names(rand_record[i]) <- feature_name
+      
+      GMM_basic_df <- data.frame(Cluster = cluster_num,
+                                     label = y2_wk5)
+}
+
+rand_df <- data.frame(names = unlist(rand_names),
+                      rand = unlist(rand_record))
+
+#define "not in"
+`%!in%` <- Negate(`%in%`)
+
+setorder(rand_df, cols = -rand)
+
+plt <- ggplot(data = rand_df, aes(y = rand, x = reorder(names, -rand))) +
+    geom_col(aes(fill = rand)) +
+  scale_fill_gradientn(colours=brewer.pal(9,"YlOrRd")) +
+    labs(title = "Most Broadly Disordered, by Adj. Rand Index") +
+         ylab("Adjusted Rand Index") +
+         xlab("Feature Set") +
+      theme_classic() +
+        theme(plot.title = element_text(hjust = 0.5, size = 25),
+              axis.text = element_text(size = 20),
+              axis.title = element_text(size = 20),
+              legend.position = "none",
+              axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+#save data
+# tmp <- as.data.frame(rand_df)
+# write.xlsx(tmp, "ARI_scores_5wk.xlsx")
+
+```
+
+#PLSRs
+```{r PLSR all features}
+# Perform a PLS-R on CFU with week 5 data and plot the scores and loadings 
+y_str <- as.numeric(cfu_NCAN)
+X_str <- as.data.frame(X_NCAN)
+X_str <- X_str[,-which(is.na(colMeans(X_NCAN)))]
+
+#set LASSO options
+opts_sel <- list(n_trials = 100, threshold = 0.9, return_count = TRUE)
+#select features with LASSO
+#Note: because LASSO involves partitioning the data, you can get slightly different
+#feature results on each run. This is also why it's important to look at features
+#highly correlated with selected features (which we do later).
+sel_features <- select_repeat(as.matrix(X_str), y_str, 
+                              selector = select_lasso, 
+                              options = opts_sel)
+X_str <- X_str[, sel_features$sel_features]
+
+# general options for plotting
+opts_plot <- list(loading_alpha = 1, # transparency for the loadings
+                  score_alpha = 1, # transparency for the scores
+                  n_LV = 2)
+
+#Train PLSR
+model <- train_ropls(X_str, y_str, options = opts_plot)
+ropls::getSummaryDF(model)
+plt_scores <- visualize_ropls_scores(model, y_str, options = opts_plot)
+print(plt_scores)
+
+plt_loadings <- visualize_ropls_loadings(model, options = opts_plot)
+print(plt_loadings)
+
+# set additional options required to color code enrichment in the bar plot of the loadings
+opts_plot$X <- X_str
+opts_plot$y <- y_str
+opts_plot$LV_ind <- 1
+opts_plot$mark_enrichment <- TRUE
+plt_loadings_bar1 <- visualize_ropls_loadings_bar(model, options = opts_plot)
+print(plt_loadings_bar1)
+opts_plot$X <- X_str
+opts_plot$y <- y_str
+opts_plot$LV_ind <- 2
+opts_plot$mark_enrichment <- TRUE
+plt_loadings_bar <- visualize_ropls_loadings_bar(model, options = opts_plot)
+print(plt_loadings_bar)
+
+# pdf("NCAN_5wk_cfu_plsr_scores.pdf", width = 6, height = 6)
+# print(plt_scores)
+# dev.off()
+# 
+# pdf("NCAN_5wk_cfu_plsr_loadings.pdf", width = 12, height = 6)
+# print(plt_loadings)
+# dev.off()
+# 
+# pdf("NCAN_5wk_cfu_plsr_bar1.pdf", width = 12, height = 6)
+# print(plt_loadings_bar1)
+# dev.off()
+
+#Save data
+# tmp <- as.data.frame(getLoadingMN(model))
+# tmp$feature <- rownames(tmp)
+# write.xlsx(tmp, "PLSR_loadings_5wk.xlsx")
+
+```
+
+#Plot y_pred vs y_actual over full CV rounds
+```{r PLSR CV - use only for plotting y_pred vs y_actual}
+
+y_str <- as.numeric(cfu_NCAN)
+X_str <- as.data.frame(X_NCAN)
+X_str <- X_str[,-which(is.na(colMeans(X_NCAN)))]
+
+y <- y_str
+X <- as.data.frame(X_str)
+
+#for 5-fold CV
+nFolds <- 5
+
+# general options for plotting
+opts_plot <- list(loading_alpha = 1, # transparency for the loadings
+                  score_alpha = 1, # transparency for the scores
+                  n_LV = 2)
+#LASSO options
+opts_sel <- list(n_trials = 100, threshold = 0.9, return_count = TRUE)
+
+nRep <- 10 #Number of CV repeats
+corrs_actual <- rep(NA, length = nRep)
+pvals_actual <- rep(NA, length = nRep)
+corrs_label <- rep(NA, length = nRep)
+pvals_label <- rep(NA, length = nRep)
+yPred_all <- matrix(NA, ncol = nRep, nrow = length(y))
+
+for (iRep in 1:nRep) {
+  print(paste("Progress: ", iRep, "/", nRep, sep = ""))
+  # Actual model trained on true labels
+  yPred <- rep(NA, length = length(y))
+  folds <- caret::createFolds(y, nFolds)
+  fold_names <- names(folds)
+  #for each fold
+  for (iFold in 1:nFolds) {
+    print(paste("Fold:", iFold, sep = " "))
+    #split into test and train
+    XTrain <- as.matrix(X[-folds[[iFold]], ])
+    yTrain <- as.numeric(y[-folds[[iFold]]])
+    XTest <- as.matrix(X[folds[[iFold]], ])
+    yTest <- y[folds[[iFold]]]
+    # Train model on training set- LASSO feature selection & PLSR model training
+    sel_features <- select_repeat(as.matrix(XTrain), yTrain, 
+                              selector = select_lasso, 
+                              options = opts_sel)
+    X_sel <- as.matrix(XTrain[, sel_features$sel_features])
+    colnames(X_sel) <- sel_features$sel_features
+    trainedModel <- train_ropls(X_sel, yTrain, options = opts_plot)
+    print("Trained Model")
+    # Prediction on test set
+      newdata <- as.matrix(XTest[,which(colnames(XTest) %in% colnames(X_sel))])
+      yPred[folds[[iFold]]] <- predict_ropls(trainedModel, as.matrix(newdata))
+  }
+  # Performance of model in terms of Spearman correlation and p-value of this correlation
+  tmp <- cor.test(y, yPred, method = "spearman")
+  corrs_actual[iRep] <- tmp$estimate
+  pvals_actual[iRep] <- tmp$p.value
+  print("Test set correlations")
+  
+  yPred_all[, iRep] <- yPred
+}
+
+# Which repetition is most representative i.e. has closest correlation and p-value to the median?
+indPlot <- order(abs(pvals_actual - median(pvals_actual)))[5] #mid of 10 reps
+tmp <- cor.test(y, yPred_all[, indPlot], method = "spearman")
+plotDf <- data.frame(yPred = yPred_all[, indPlot], y = y, 
+                     ID = rownames(X), group = factor("NCAN"))
+colnames(plotDf) <- c("model", "data", "ID", "group")
+
+#Plot representation repetition
+plt <- ggplot(plotDf, aes(x = as.numeric(y), 
+                          y = as.numeric(yPred))) +
+  geom_smooth(method = "lm", se = TRUE, level = 0.9, color = 'black') +
+  geom_point(aes(color = -y), size = 3) +
+  theme_classic() +
+  theme(#aspect.ratio = 1,
+        plot.title = element_text(size = 15),
+        legend.position = "none") +
+  ggtitle(paste0("Spearman R = ", formatC(tmp$estimate, 
+                                            digits = 2, format = "f"),
+            ", p = ", formatC(tmp$p.value, digits = 3, format = "e"), sep = "")) +
+  ylab("Predicted CFU") +  # Adjusted label
+  xlab("Measured CFU")  # Adjusted label
+
+print(plt)
+
+#Save data
+# write.xlsx(plotDf, "PLSR_corr_representative_5wk.xlsx")
+# 
+# # The one representatively shown in the manuscript is the one with the median correlation and p-value
+# pdf("NCAN_plsr_5wk_crossVal_representative.pdf",
+# width = 5, height = 5)
+# print(plt)
+# dev.off()
+
+#Actually plot a representative of all
+tmp <- list()
+for (i in 1:10){
+  tmp[[i]] <- cor.test(y, yPred_all[, i], method = "spearman")
+}
+
+# Extract 'estimate' values from the list
+estimate_values <- sapply(tmp, function(x) x$estimate)
+# Calculate the average of 'estimate' values
+average_estimate <- mean(estimate_values)
+# Extract 'p' values from the list
+p_values <- sapply(tmp, function(x) x$p.value)
+# Calculate the average of 'p' values
+average_p <- mean(p_values)
+
+
+ID = rownames(X)
+plotDF <- data.frame(yPred = c(yPred_all[,1],
+                               yPred_all[,2],
+                               yPred_all[,3],
+                               yPred_all[,4],
+                               yPred_all[,5],
+                               yPred_all[,6],
+                               yPred_all[,7],
+                               yPred_all[,8],
+                               yPred_all[,9],
+                               yPred_all[,10]),
+                      y_real = c(y,y,y,y,y,y,y,y,y,y))
+
+plt <- ggplot(plotDF, aes(x = as.numeric(y_real), y = as.numeric(yPred))) +
+  geom_boxplot(aes(group = y_real), width = 0.1, 
+               position = position_dodge(width = 0.1)) +  # Adjust width and position
+      geom_point(color = 'darkgrey', size =1) +
+  theme_classic() +
+  theme(#aspect.ratio = 1,
+        plot.title = element_text(size = 15),
+        legend.position = "none") +
+  ggtitle(paste0("mean Spearman R = ", formatC(average_estimate, 
+                                            digits = 2, format = "f"),
+            ", mean p = ", formatC(average_p, digits = 3, format = "e"), sep = "")) +
+  ylab("Predicted CFU") +  # Adjusted label
+  xlab("Measured CFU")  # Adjusted label
+
+# pdf("/NCAN_plsr_5wk_crossVal_10round_boxplots.pdf",
+# width = 7, height = 5)
+# print(plt)
+# dev.off()
+
+print(plt)
+
+#Save data
+#write.xlsx(plotDF, "PLSR_10_rounds_all_5wk.xlsx")
+
+```
+
+```{r cross-validate PLSR}
+#Get X, y, strain values
+y <- cfu_NCAN
+X <- as.data.frame(X_NCAN)
+X[is.na(colMeans(X))] <- 0
+strain <- y1_wk5[which(y2_wk5 == "R")]
+
+#5-fold CV performance (to be comparable to one fold per strain set)
+#set CV parameters
+opts_sel$return_count <- FALSE
+select <- function(X, y) { return(select_repeat(X, y, 
+                        selector = select_lasso, options = opts_sel)) }
+method = list(select = select,
+              train = train_ropls,
+              predict = predict_ropls,
+              score = score_spearman)
+opts = list(n_folds = 5, rf_trials = 100, pt_trials = 100)
+
+#actually run CV
+return_vals <- cross_validation_unpaired(as.matrix(X), y, method, opts, n_trials = 10)
+#saveRDS(return_vals, "full_CV_rf_pt_newGating.rds")
+print(paste("Performance in 5-fold cv:", return_vals$cv_score, "R^2"))
+
+#Leaving each strain out once performance
+#does NOT test model on new strain, just uses 4 strains to build model to make
+#sure it's not just one driving it
+r2_strain <- list()
+for (sel_strain in unique(strain)){
+  X_train <- X[-which(strain == sel_strain),]
+  y_train <- y[-which(strain == sel_strain)]
+  X_test <- X[which(strain == sel_strain),]
+  y_test <- y[which(strain == sel_strain)]
+
+  method = list(select = select,
+              train = train_ropls,
+              predict = predict_ropls,
+              score = score_spearman)
+  opts = list(n_folds = 5, rf_trials = 0, pt_trials = 0)
+  return_vals <- cross_validation_unpaired(as.matrix(X_train), y_train, 
+                                           method, opts, n_trials = 100)
+  saveRDS(return_vals, paste0("canon_CV_minus_", sel_strain, "_newGating.rds"))
+}
+
+plt <- visualize_validate_specialized(return_vals, r2_full, r2_strain)
+plt
+#pdf("scaled_CFU_NCAN_CVfigure_spearman.pdf", width = 9, height = 6)
+#print(plt)
+#dev.off()
+#print(plt)
+
+#Predict Canonical CFU
+y <- cfu_canon
+X <- as.data.frame(X_canon)
+X[is.na(colMeans(X))] <- 0
+strain <- y1_wk5[which(y2_wk5 == "C")]
+
+#Canonical 5-fold CV performance (to be comparable to one fold per strain set)
+method = list(select = select,
+              train = train_ropls,
+              predict = predict_ropls,
+              score = score_spearman)
+opts = list(n_folds = 5, rf_trials = 0, pt_trials = 0)
+#return_vals <- validate_repeat(as.matrix(X), y, method, opts, n_trials = 100)
+return_vals_canon <- cross_validation_unpaired(as.matrix(X), y, method, opts, n_trials = 100)
+#saveRDS(return_vals_canon, "full_CV_newGating_canon.rds")
+
+#NCAN model on canonical data
+#get NCAN model
+#Get X, y, strain values
+y <- cfu_NCAN
+X <- as.data.frame(X_NCAN)
+X[is.na(colMeans(X))] <- 0
+strain <- y1_wk5[which(y2_wk5 == "R")]
+
+#Full model performance
+sel_features <- select_repeat(as.matrix(X), y, 
+                              selector = select_lasso, 
+                              options = opts_sel)
+X_sel <- as.matrix(X[, sel_features])
+trainedModel <- train_ropls(X_sel, y, options = opts_plot)
+y_pred <- predict_ropls(trainedModel, X_sel)
+r2_full <- score_spearman(y, y_pred)
+print(paste("Performance on full data set:", r2_full, "R^2"))
+
+y <- cfu_canon
+X <- as.data.frame(X_canon)
+X[is.na(colMeans(X))] <- 0
+
+X_canon_pred <- X_canon[, sel_features]
+y_pred <- predict_ropls(trainedModel, X_canon_pred)
+r2_full <- score_spearman(y, y_pred)
+
+#saveRDS(r2_full, "full_CV_newGating_NCAN_on_canon.rds")
+
+
+```
+
+#If you have saved your CV values from previously running prior chunks,
+#you can use this section to plot them
+```{r plot CV values}
+
+pathname <- "/Cross Validations/"
+#load data- replace with your saved CV names
+full_NCAN_cv <- readRDS(paste0(pathname, "full_CV_rf_pt_newGating_17Jul24.rds"))
+full_canon_cv <- readRDS(paste0(pathname, "full_CV_newGating_canon_17Jul24.rds"))
+no_CC039_cv <- readRDS(paste0(pathname, "full_CV_minus_CC039_newGating_17Jul24.rds"))
+no_CC024_cv <- readRDS(paste0(pathname, "full_CV_minus_CC024_newGating_17Jul24.rds"))
+no_CC018_cv <- readRDS(paste0(pathname, "full_CV_minus_CC018_newGating_17Jul24.rds"))
+no_CC009_cv <- readRDS(paste0(pathname, "full_CV_minus_CC009_newGating_17Jul24.rds"))
+no_PWK_cv <- readRDS(paste0(pathname, "full_CV_minus_PWK_newGating_17Jul24.rds"))
+NCAN_model_canon_data_cv <- readRDS(paste0(pathname, "full_CV_newGating_NCAN_on_canon_17Jul24.rds"))
+
+#format data into df for plotting
+cv_ind <- which(grepl("cv", names(unlist(full_NCAN_cv))))
+NCAN_cv <- data.frame(CV = unlist(full_NCAN_cv)[cv_ind],
+           type = rep("5-fold Cross Validation- NCAN", length(cv_ind)))
+
+rf_ind <- which(grepl("rf", names(unlist(full_NCAN_cv))))
+NCAN_rf <- data.frame(CV = unlist(full_NCAN_cv)[rf_ind],
+                      type = rep("Random Features - NCAN", length(rf_ind)))
+
+pt_ind <- which(grepl("pt", names(unlist(full_NCAN_cv))))
+NCAN_pt <- data.frame(CV = unlist(full_NCAN_cv)[pt_ind],
+                      type = rep("Permuted Labels - NCAN", length(pt_ind)))
+
+canon_cv <- data.frame(CV = unlist(full_canon_cv),
+                       type = rep("5-fold Cross Validation- Canonical",
+                                  length(full_canon_cv)))
+
+no39_cv <- data.frame(CV = unlist(no_CC039_cv),
+                      type = rep("-CC039 - NCAN", 
+                                 length(no_CC039_cv)))
+
+no24_cv <- data.frame(CV = unlist(no_CC024_cv),
+                      type = rep("-CC024 - NCAN", 
+                                 length(no_CC024_cv)))
+
+no18_cv <- data.frame(CV = unlist(no_CC018_cv),
+                      type = rep("-CC018 - NCAN", 
+                                 length(no_CC018_cv)))
+
+no9_cv <- data.frame(CV = unlist(no_CC009_cv),
+                     type = rep("-CC009 - NCAN", 
+                                length(no_CC009_cv)))
+
+noPWK_cv <- data.frame(CV = unlist(no_PWK_cv),
+                       type = rep("-PWK - NCAN", 
+                                  length(no_PWK_cv)))
+
+NCAN_on_canon_cv <- data.frame(CV = NCAN_model_canon_data_cv,
+                               type = rep("NCAN model, Canonical data",
+                                          length(NCAN_model_canon_data_cv)))
+
+
+plotting_df <- rbind(NCAN_cv, NCAN_rf, NCAN_pt, canon_cv, no39_cv, no24_cv,
+                     no18_cv, no9_cv, noPWK_cv, NCAN_on_canon_cv)
+plotting_df$type <- as.factor(plotting_df$type)
+
+# Reordering the 'type' column according to the specified order
+plotting_df$type <- factor(plotting_df$type, levels = c(
+  "5-fold Cross Validation- NCAN", "Random Features - NCAN", "Permuted Labels - NCAN", 
+  "5-fold Cross Validation- Canonical", "NCAN model, Canonical data", 
+  "-CC039 - NCAN", "-CC024 - NCAN", "-CC018 - NCAN", "-CC009 - NCAN", "-PWK - NCAN"
+))
+
+pairwise_comparisons_main <- combn(c(
+  "5-fold Cross Validation- NCAN",
+  "5-fold Cross Validation- Canonical", 
+  "NCAN model, Canonical data"),
+  2, simplify = FALSE)
+pairwise_comparisons_supp <- combn(c(
+  "5-fold Cross Validation- NCAN", "Random Features - NCAN", "Permuted Labels - NCAN", 
+  "-CC039 - NCAN", "-CC024 - NCAN", "-CC018 - NCAN", "-CC009 - NCAN", "-PWK - NCAN"),
+  2, simplify = FALSE)
+# Filter pairwise comparisons to include only those involving "5-fold Cross Validation- NCAN"
+pairwise_comparisons_main <- pairwise_comparisons_main[which(grepl("5-fold Cross Validation- NCAN",pairwise_comparisons_main))]
+pairwise_comparisons_supp <- pairwise_comparisons_supp[which(grepl("5-fold Cross Validation- NCAN",pairwise_comparisons_supp))]
+
+# Creating the plots
+main_figure <- c("5-fold Cross Validation- NCAN",
+                 "5-fold Cross Validation- Canonical",
+                 "NCAN model, Canonical data")
+
+plotting_df_main <- plotting_df[which(plotting_df$type %in% main_figure),]
+plt_main <- ggplot(plotting_df_main, aes(x = type, y = CV, group = type)) +
+  geom_jitter(color = "cornflowerblue", size = 1) +  # Black points
+  geom_hline(yintercept = 0, linetype = "solid", color = "black") +  # Dashed line at y = 0
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "cornflowerblue") +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.2, size = 0.1,
+               color = "black") + 
+  stat_summary(fun.data = mean_sd, geom = "errorbar", width = 0.2) +
+  #This performed a wilcoxon comparison, but we will be adjusting these p-values
+  #for multiple hypothesis testing
+  stat_compare_means(comparisons = pairwise_comparisons_main, paired=FALSE)+
+  theme_classic() +
+  xlab("") +
+  ylab("Spearman Correlation") +
+  #ylim(-1,1) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  # Rotate x-axis labels
+
+# pdf("/Figures/New gating figures/full_CVfigure_spearman_17Jul24_main.pdf", width = 2.97, height = 4.36)
+# print(plt_main)
+# dev.off()
+
+supp_figure <- c("5-fold Cross Validation- NCAN",
+                 "Random Features - NCAN",
+                 "Permuted Labels - NCAN",
+                 "-CC039 - NCAN",
+                 "-CC024 - NCAN",
+                 "-CC018 - NCAN",
+                 "-CC009 - NCAN",
+                 "-PWK - NCAN")
+plotting_df_supp <- plotting_df[which(plotting_df$type %in% supp_figure),]
+plt_supp <- ggplot(plotting_df_supp, aes(x = type, y = CV, group = type)) +
+  geom_jitter(color = "cornflowerblue", size = 0.5) +  # Black points
+  geom_hline(yintercept = 0, linetype = "solid", color = "black") +  # Dashed line at y = 0
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "cornflowerblue") +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.2, size = 0.1,
+               color = "black") + 
+  stat_summary(fun.data = mean_sd, geom = "errorbar", width = 0.2) +
+  #This performed a wilcoxon comparison, but we will be adjusting these p-values
+  #for multiple hypothesis testing
+  stat_compare_means(comparisons = pairwise_comparisons_supp, paired=FALSE)+
+  theme_classic() +
+  xlab("") +
+  ylab("Spearman Correlation") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  # Rotate x-axis labels
+
+# pdf("/Figures/New gating figures/full_CVfigure_spearman_17Jul24_supp.pdf", width = 3.22, height = 3.58)
+# print(plt_supp)
+# dev.off()
+
+# Assuming 'vector1' and 'vector2' are the two vectors
+# Assuming 'pairwise_comparisons' contains pairwise comparisons
+result_P <- lapply(pairwise_comparisons_main, function(pair) {
+  if (pair[1] == "5-fold Cross Validation- NCAN") {
+    #get data
+    vector1 <- plotting_df$CV[which(plotting_df$type == pair[1])]
+    vector2 <- plotting_df$CV[which(plotting_df$type == pair[2])]
+
+    #calculate Mann-Whitney p-value
+    p <- wilcox.test(vector1, vector2, paired = FALSE)
+    p <- p$p.value
+    names(p) <- pair[2]
+    return(p)
+  } else {
+    return(NA)  # Return NA for comparisons where the first element is not "5-fold Cross Validation- NCAN"
+  }
+})
+#Benjamini-Hochberg p-value adjustment for multiple-hypothesis correction
+p.adjust <- p.adjust(unlist(result_P), method = "BH")
+#manually add this to plot
+
+#Save data
+#write.xlsx(plotting_df_main, "PLSR_cv_main.xlsx")
+#write.xlsx(plotting_df_supp, "PLSR_cv_sup0.xlsx")
+
+```
+
+#If you have saved your CV values from previously running prior chunks,
+#you can use this section to plot them
+```{r canonical PLSR}
+pathname <- "/Cross Validations/"
+full_canon_cv <- readRDS(paste0(pathname, "canon_CV_pt_newGating_31Jul24.rds"))
+no_B6_cv <- readRDS(paste0(pathname, "canon_CV_minus_B6_newGating_01Aug24.rds"))
+no_CC001_cv <- readRDS(paste0(pathname, "canon_CV_minus_CC001_newGating_01Aug24.rds"))
+no_CC011_cv <- readRDS(paste0(pathname, "canon_CV_minus_CC011_newGating_01Aug24.rds"))
+no_CC059_cv <- readRDS(paste0(pathname, "canon_CV_minus_CC059_newGating_01Aug24.rds"))
+cv_ind <- which(grepl("cv", names(unlist(full_canon_cv))))
+canon_cv <- data.frame(CV = unlist(full_canon_cv)[cv_ind],
+                      type = rep("5-fold Cross Validation- Canon", length(cv_ind)))
+pt_ind <- which(grepl("pt", names(unlist(full_canon_cv))))
+canon_pt <- data.frame(CV = unlist(full_canon_cv)[pt_ind],
+                      type = rep("Permuted Labels - Canon", length(pt_ind)))
+noB6_cv <- data.frame(CV = unlist(no_B6_cv),
+                      type = rep("-B6 - Canon", 
+                                 length(no_B6_cv)))
+noCC001_cv <- data.frame(CV = unlist(no_CC001_cv),
+                      type = rep("-CC001 - Canon", 
+                                 length(no_CC001_cv)))
+noCC011_cv <- data.frame(CV = unlist(no_CC011_cv),
+                      type = rep("-CC011 - Canon", 
+                                 length(no_CC011_cv)))
+noCC059_cv <- data.frame(CV = unlist(no_CC059_cv),
+                      type = rep("-CC059 - Canon", 
+                                 length(no_CC059_cv)))
+
+plotting_df <- rbind(canon_cv, canon_pt, noB6_cv, noCC001_cv,
+                     noCC011_cv, noCC059_cv)
+plotting_df$type <- as.factor(plotting_df$type)
+
+pairwise_comparisons_main <- combn(c("5-fold Cross Validation- Canon",
+                                     "Permuted Labels - Canon",
+            "-B6 - Canon", "-CC001 - Canon", "-CC011 - Canon",
+            "-CC059 - Canon"), 2, 
+                                   simplify = FALSE)
+
+pairwise_comparisons_main <- pairwise_comparisons_main[which(grepl("5-fold",pairwise_comparisons_main))]
+
+plt_ind <- which(plotting_df$type %in% 
+                    c("5-fold Cross Validation- Canon",
+                                 "-CC001 - Canon"))
+
+plt_main <- ggplot(plotting_df[plt_ind,], 
+                   aes(x = type, y = CV, group = type)) +
+    geom_jitter(color = "cornflowerblue", size = 1) +  # Black points
+    geom_hline(yintercept = 0, linetype = "solid", color = "black") +  # Dashed line at y = 0
+    geom_hline(yintercept = 0.5, linetype = "dashed", color = "cornflowerblue") +
+    stat_summary(fun = mean, geom = "crossbar", width = 0.2, size = 0.1,
+                 color = "black") + 
+    stat_summary(fun.data = mean_sd, geom = "errorbar", width = 0.2) +
+    #This performed a wilcoxon comparison, but we will be adjusting these p-values
+    #for multiple hypothesis testing
+    stat_compare_means(comparisons = pairwise_comparisons_main[[3]],
+                       paired=FALSE)+
+    theme_classic() +
+    xlab("") +
+    ylab("Spearman Correlation") +
+    ylim(-0.5,1) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))  # Rotate x-axis labels
+
+# pdf("canonical_cv_2.pdf", width = 1.08, height = 3.58)
+# print(plt_main)
+# dev.off()
+
+#manually add p value to plot
+result_P <- lapply(pairwise_comparisons_main, function(pair) {
+  if (pair[1] == "5-fold Cross Validation- Canon") {
+    #get data
+    vector1 <- plotting_df$CV[which(plotting_df$type == pair[1])]
+    vector2 <- plotting_df$CV[which(plotting_df$type == pair[2])]
+
+    #calculate Mann-Whitney p-value
+    p <- wilcox.test(vector1, vector2, paired = FALSE)
+    p <- p$p.value
+    names(p) <- pair[2]
+    return(p)
+  } else {
+    return(NA)
+  }
+})
+#Benjamini-Hochberg p-value adjustment for multiple-hypothesis correction
+p.adjust <- p.adjust(unlist(result_P), method = "BH")
+```
+
+#Correlations
+
+#Correlates with selected PLSR features - and null distribution calc.
+```{r cfu plsr correlates}
+#Get X, y, strain values
+y <- cfu_NCAN
+X <- as.data.frame(X_NCAN)
+X[is.na(colMeans(X))] <- 0
+
+#Full model performance
+sel_features <- select_repeat(as.matrix(X), y, 
+                              selector = select_lasso, 
+                              options = opts_sel)
+
+#Get selected features for full dataset
+selected_ft <- sel_features$sel_features
+#Get features abs(corr) > 0.7 correlated with these features
+corrMat <- cor(apply(as.matrix.noquote(X),2,as.numeric), method = "spearman")
+# keep only highly correlated features to selected features
+colMax <- function(X) apply(X, 2, max)
+corrMat <- corrMat[selected_ft,]
+corrMat <- corrMat[,which(colMax(abs(corrMat)) < 1.1 & colMax(abs(corrMat) > 0.7))]
+
+#Start list of features and correlations
+CFU_features <- list(selected_ft)
+
+#Accept only features more than randomly correlated with each
+#Create null distribution of random measures for each feature
+#Calculate the cutoff correlation for that feature and store
+
+for (feat in selected_ft){
+  #Calculate correlations
+  #corrMat <- corrMat[selected_ft,]
+  #Add stringency
+  #Calculate random correlation distribution
+  corrMatPerm_list <- list()
+  for (i in 1:10){
+    #Generate permutation df
+    yPerm <- sample(X[,which(colnames(X) == feat)], size = nrow(X), replace = F)
+    XPerm <- X
+    XPerm[,which(colnames(X) == feat)] <- yPerm
+
+    #Generate null distribution of permutations
+    corrMatPerm <- cor(apply(as.matrix.noquote(XPerm),2,as.numeric), method = "spearman")
+    corrMatPerm <- corrMatPerm[feat, ]
+    corrMatPerm_list <- append(corrMatPerm_list, corrMatPerm)
+  }
+  #Toss any correlations to features that fall outside 0.05 level
+  keep_value <- quantile(abs(as.numeric(unlist(corrMatPerm_list))), probs = 0.95, na.rm = T)
+  corrMat_tmp <- corrMat[feat,]
+  corrMat_tmp <- corrMat_tmp[which(abs(corrMat_tmp) > keep_value)]
+  corrMat_tmp <- corrMat_tmp[which(abs(corrMat_tmp) > 0.8)]
+  CFU_features <- append(CFU_features, names(corrMat_tmp))
+}
+
+#Test if all features are higher in high CFU
+ft_2_keep <- unique(unlist(CFU_features))
+cor_df <- cbind(X,y)
+CFU_corrMat <- cor(cor_df, method = "spearman")
+CFU_corrMat <- CFU_corrMat[which(rownames(CFU_corrMat) %in% ft_2_keep),"y"]
+
+#take positives as associated with high CFU, negatives as associated with low CFU
+#some of the features are not highly correlated with CFU, but this is OKAY, 
+#because they're highly correlated with at least one LASSO-selected feature
+
+pos_corr_ft <- names(CFU_corrMat)[which(CFU_corrMat > 0)]
+neg_corr_ft <- names(CFU_corrMat)[which(CFU_corrMat < 0)]
+```
+
+## Pretty co-correlation network with PLSR LASSO features
+```{r Co-correlation network, message=FALSE} 
+
+#Pull Spearman correlations
+tidyCors <- X %>% 
+  correlate(method = "spearman") %>% 
+  stretch()
+
+#get p-values using a different package
+tidyCors$p <- 0
+for (ind in 1:dim(tidyCors)[1]) {
+  tmp <- cor.test(X[,tidyCors$x[ind]], X[,tidyCors$y[ind]], 
+                  method = "spearman", exact = FALSE)
+  tidyCors$p[ind] <- tmp$p.value
+}
+tidyCors$p <- p.adjust(tidyCors$p, method = "BH", n = length(tidyCors$p))
+  
+plotFeatures <- selected_ft
+
+#Remove insignificant correlations & ones that didn't pass the null
+#distribution test
+graphCors <- tidyCors %>% 
+  filter(p < 0.01 & (is.element(x, plotFeatures) | is.element(y, plotFeatures))) %>% 
+  filter((is.element(x, ft_2_keep) & is.element(y, plotFeatures)) |
+            (is.element(x, plotFeatures) & is.element(y, ft_2_keep))) %>% 
+  graph_from_data_frame(directed = FALSE)
+
+#could also do "nicely" or "with_kk" as the algorithm
+layout <- create_layout(graphCors, layout = 'igraph', algorithm = 'in_circle')
+
+nodeColours <- vector(mode = "list", length = length(V(graphCors)$name))
+outlineColours <- vector(mode = "list", length = length(V(graphCors)$name))
+
+#Select colors for the correlated features based on cell type
+pal <- wes_palette("GrandBudapest2", 6, type = "continuous")
+CD4_ft <- V(graphCors)$name[which(grepl("CD4_",V(graphCors)$name))]
+CD8_ft <- V(graphCors)$name[which(grepl("CD8_",V(graphCors)$name))]
+mac_ft <- V(graphCors)$name[which(grepl("Mac|mac",V(graphCors)$name))]
+mono_ft <- V(graphCors)$name[which(grepl("Mono|mono",V(graphCors)$name))]
+NK_ft <- V(graphCors)$name[which(grepl("NK",V(graphCors)$name))]
+gd_DN_ft <- V(graphCors)$name[which(grepl("gd|DN",V(graphCors)$name))]
+other_ft <- V(graphCors)$name[-which(V(graphCors)$name %in% c(CD4_ft, CD8_ft, 
+                                                    mac_ft, mono_ft,
+                                                    NK_ft, gd_DN_ft,plotFeatures))] 
+
+#Color by cell subset
+nodeColours[is.element(V(graphCors)$name, CD4_ft)] <- pal[1] # CD4 T cells
+nodeColours[is.element(V(graphCors)$name, CD8_ft)] <- pal[2] # CD8 T cells
+nodeColours[is.element(V(graphCors)$name, mac_ft)] <- pal[3] # Macrophage
+nodeColours[is.element(V(graphCors)$name, mono_ft)] <- pal[4] # Monocyte
+nodeColours[is.element(V(graphCors)$name, NK_ft)] <- pal[5] # NK
+nodeColours[is.element(V(graphCors)$name, gd_DN_ft)] <- pal[6] # gd or DN T 
+nodeColours[is.element(V(graphCors)$name, other_ft)] <- 'white' # other
+nodeColours[is.element(V(graphCors)$name, plotFeatures)] <- 'gray' # selected features
+
+#outline by feature relationship with CFU
+outlineColours[is.element(V(graphCors)$name, neg_corr_ft)] <- 'darkblue' # other
+outlineColours[is.element(V(graphCors)$name, pos_corr_ft)] <- 'darkred' # other
+
+#Plot!
+pltGraph <- ggraph(layout) +
+  geom_edge_link(aes(color = r), edge_width = .5) +
+  guides(edge_alpha = "none", edge_width = "none") +
+  scale_edge_colour_gradientn(colors = rev(colorRampPalette(brewer.pal(n = 11, name = "RdBu"))(100)[1:80])) +
+  geom_node_point(shape = 21, color = outlineColours, fill = nodeColours, size = 11, stroke = 1) +
+  geom_node_text(aes(label = name), size = 3, point.padding = NA, 
+                 box.padding = 0, force = 0.1, repel = F) + 
+  theme(aspect.ratio = 1) +
+  theme_graph(background = "white", base_family = 'Helvetica') 
+plt <- plot(pltGraph)
+
+# pdf("/Figures/New gating figures/cocorrelate_network_CFU_PLSR.pdf", width = 10, height = 10)
+# print(plt)
+# dev.off()
+
+#save data
+saveCors <- tidyCors %>% 
+  filter(p < 0.01 & (is.element(x, plotFeatures) | is.element(y, plotFeatures))) %>% 
+  filter((is.element(x, ft_2_keep) & is.element(y, plotFeatures)) |
+            (is.element(x, plotFeatures) & is.element(y, ft_2_keep))) 
+#write.xlsx(saveCors, "PLSR_CFU_correlations.xlsx")
+
+```
