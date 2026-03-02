@@ -69,4 +69,4 @@ This is the tested environment, but program may run with other specifications.
 
 Analysis was carried out under macOS Sonoma 14.2.1 with R run via R Studio Version 4.3.1 (2023-06-16)
 
-R scripts define useful functions, while Markdowns are organized by analysis category and were used for both analysis and visualization. scRNA-seq data generated in this study can be accessed via raw FASTQ files on SRA with BioProject accession number PRJNA1045547. Human SELECT-seq data used for TransCompR can be accessed as a processed Seurat object at https://zenodo.org/records/7946277. 
+R scripts define useful functions, while Markdowns are organized by analysis category and were used for both analysis and visualization. scRNA-seq data generated in this study can be accessed via raw FASTQ files on SRA with BioProject accession number PRJNA1045547. The annotated Seurat object can be accessed via GEO with accession number GSE277712. Human SELECT-seq data used for TransCompR can be accessed as a processed Seurat object at https://zenodo.org/records/7946277. 
